@@ -1,0 +1,100 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/csy20/agt/internal/api"
+	"github.com/csy20/agt/internal/config"
+	"github.com/csy20/agt/internal/model"
+	"github.com/csy20/agt/internal/orch"
+	"github.com/csy20/agt/internal/sandbox"
+	"github.com/csy20/agt/internal/store"
+	"github.com/csy20/agt/internal/telemetry"
+	"github.com/csy20/agt/internal/usage"
+	"github.com/csy20/agt/internal/workspace"
+)
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	cfg := config.Load()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		slog.Error("data dir", "err", err)
+		return 1
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	st, err := store.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		slog.Error("postgres", "err", err)
+		return 1
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		slog.Error("migrate", "err", err)
+		return 1
+	}
+	runner := &sandbox.Runner{Image: cfg.SandboxImage}
+	engine := orch.New(orch.Options{
+		Store:   st,
+		DataDir: cfg.DataDir,
+		Prices: usage.Prices{
+			InputPerMillion:  cfg.InputPerMillion,
+			OutputPerMillion: cfg.OutputPerMillion,
+		},
+		Tel: telemetry.New(cfg.OTLPEndpoint),
+		ModelFor: func(current store.Run) (model.Provider, error) {
+			switch current.Provider {
+			case "fake", "":
+				script, err := model.ParseScript(current.ScriptJSON)
+				if err != nil {
+					return nil, err
+				}
+				return model.NewFake(script), nil
+			case "openai":
+				return model.NewOpenAI(cfg.ModelBaseURL, cfg.ModelAPIKey, cfg.ModelName), nil
+			default:
+				return nil, fmt.Errorf("unknown provider %s", current.Provider)
+			}
+		},
+		NewWorkspace: func(current store.Run) (workspace.Handle, error) {
+			dir := workspace.NewDir(current.Worktree, orch.BasePath(current.Worktree), func(ctx context.Context, root string) (string, string, int, error) {
+				return runner.RunTest(ctx, root, current.ID)
+			})
+			dir.CloseFn = func(ctx context.Context) error {
+				return runner.Destroy(ctx, current.ID)
+			}
+			return dir, nil
+		},
+	})
+	worker := &orch.Worker{Store: st, Run: engine.Run}
+	go worker.Loop(ctx)
+	httpServer := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           api.New(st, cfg).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shut, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shut)
+	}()
+	slog.Info("listening", "addr", cfg.ListenAddr, "data_dir", cfg.DataDir)
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("http", "err", err)
+		return 1
+	}
+	return 0
+}

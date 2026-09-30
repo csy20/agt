@@ -1,0 +1,214 @@
+package workspace
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/csy20/agt/internal/tools"
+)
+
+// TestFunc runs the fixed repository test command. Production points it at a
+// sandbox; tests may point it at a local interpreter.
+type TestFunc func(ctx context.Context, root string) (stdout, stderr string, code int, err error)
+
+// Handle is the workspace the orchestrator is allowed to touch.
+type Handle interface {
+	Search(ctx context.Context, query string) (string, int, error)
+	Read(ctx context.Context, path string, start, end int) (string, int, error)
+	Diff(ctx context.Context) (string, int, error)
+	Patch(ctx context.Context, path, old, new string) (string, int, error)
+	Test(ctx context.Context) (string, int, error)
+	Calls() []string
+	Close(ctx context.Context) error
+}
+
+// Dir performs file tools on a copied worktree. Test execution is injected so
+// model-requested process execution is not the control-plane shell.
+type Dir struct {
+	Work    string
+	Base    string
+	TestFn  TestFunc
+	CloseFn func(context.Context) error
+
+	mu    sync.Mutex
+	calls []string
+}
+
+func NewDir(work, base string, testFn TestFunc) *Dir {
+	return &Dir{Work: work, Base: base, TestFn: testFn}
+}
+
+func (d *Dir) note(tool string) {
+	d.mu.Lock()
+	d.calls = append(d.calls, tool)
+	d.mu.Unlock()
+}
+
+func (d *Dir) Calls() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]string, len(d.calls))
+	copy(out, d.calls)
+	return out
+}
+
+func (d *Dir) Search(_ context.Context, query string) (string, int, error) {
+	d.note("search_code")
+	out, err := tools.Search(d.Work, query)
+	if err != nil {
+		return err.Error(), 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Read(_ context.Context, path string, start, end int) (string, int, error) {
+	d.note("read_file_range")
+	out, err := tools.ReadRange(d.Work, path, start, end)
+	if err != nil {
+		return err.Error(), 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Diff(context.Context) (string, int, error) {
+	d.note("git_diff")
+	out, err := tools.Diff(d.Base, d.Work)
+	if err != nil {
+		return err.Error(), 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Patch(_ context.Context, path, old, new string) (string, int, error) {
+	d.note("apply_patch")
+	out, err := tools.Patch(d.Work, path, old, new)
+	if err != nil {
+		return err.Error(), 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Test(ctx context.Context) (string, int, error) {
+	d.note("run_test")
+	if d.TestFn == nil {
+		return "", 0, fmt.Errorf("no test runner configured")
+	}
+	stdout, stderr, code, err := d.TestFn(ctx, d.Work)
+	if err != nil {
+		return "", code, err
+	}
+	out := strings.TrimSpace(stdout + "\n" + stderr)
+	if out == "" {
+		out = "(no output)"
+	}
+	return out, code, nil
+}
+
+func (d *Dir) Close(ctx context.Context) error {
+	if d.CloseFn != nil {
+		return d.CloseFn(ctx)
+	}
+	return nil
+}
+
+// Materialize copies repo into dataDir/runs/<id>/{work,base}. Symlinks are refused.
+func Materialize(repo, dataDir, runID string) (work, base string, err error) {
+	root := filepath.Join(dataDir, "runs", runID)
+	if err := os.RemoveAll(root); err != nil {
+		return "", "", err
+	}
+	work = filepath.Join(root, "work")
+	base = filepath.Join(root, "base")
+	if err := copyTree(repo, work); err != nil {
+		return "", "", err
+	}
+	if err := copyTree(repo, base); err != nil {
+		return "", "", err
+	}
+	return work, base, nil
+}
+
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("copy escapes source")
+		}
+		target := filepath.Join(dst, rel)
+		if d.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to copy symlink %s", rel)
+		}
+		if d.IsDir() {
+			if rel != "." && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return os.MkdirAll(target, 0o755)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		return copyFile(path, target)
+	})
+}
+
+func copyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// HostPython runs the fixture unittest on the host. The server does not use it.
+func HostPython(ctx context.Context, root string) (string, string, int, error) {
+	cmd := exec.CommandContext(ctx, "python3", "-m", "unittest", "tests.test_retry")
+	cmd.Dir = root
+	cmd.Env = hostPythonEnv(root)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return stdout.String(), stderr.String(), 0, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return stdout.String(), stderr.String(), exit.ExitCode(), nil
+	}
+	return stdout.String(), stderr.String(), 0, err
+}
+
+func hostPythonEnv(root string) []string {
+	env := make([]string, 0, 16)
+	for _, item := range os.Environ() {
+		if strings.HasPrefix(item, "PYTHONPATH=") || strings.HasPrefix(item, "PYTHONDONTWRITEBYTECODE=") {
+			continue
+		}
+		env = append(env, item)
+	}
+	return append(env, "PYTHONDONTWRITEBYTECODE=1", "PYTHONPATH="+root)
+}

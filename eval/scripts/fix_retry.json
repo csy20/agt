@@ -1,0 +1,85 @@
+{
+  "steps": [
+    {
+      "plan": {
+        "goal": "Fix intermittent double charge on retry",
+        "constraints": [
+          "no public API changes",
+          "must pass payments tests"
+        ],
+        "steps": [
+          {
+            "id": "s1",
+            "intent": "locate charge path",
+            "depends_on": [],
+            "risk": "read"
+          },
+          {
+            "id": "s2",
+            "intent": "reproduce failing retry test",
+            "depends_on": [
+              "s1"
+            ],
+            "risk": "sandbox_execute"
+          },
+          {
+            "id": "s3",
+            "intent": "apply idempotent charge",
+            "depends_on": [
+              "s2"
+            ],
+            "risk": "workspace_write"
+          }
+        ]
+      },
+      "input_tokens": 400,
+      "output_tokens": 80
+    },
+    {
+      "tool": "search_code",
+      "args": {
+        "query": "def charge"
+      },
+      "input_tokens": 300,
+      "output_tokens": 40
+    },
+    {
+      "tool": "read_file_range",
+      "args": {
+        "path": "payments/processor.py",
+        "start": 1,
+        "end": 80
+      },
+      "input_tokens": 300,
+      "output_tokens": 40
+    },
+    {
+      "tool": "run_test",
+      "args": {},
+      "input_tokens": 300,
+      "output_tokens": 40
+    },
+    {
+      "tool": "apply_patch",
+      "args": {
+        "path": "payments/processor.py",
+        "old": "    def __init__(self):\n        self.ledger = []\n\n    def charge(self, idempotency_key: str, amount: int) -> int:\n        self.ledger.append((idempotency_key, amount))\n        return len(self.ledger)\n",
+        "new": "    def __init__(self):\n        self.ledger = []\n        self.charged = {}\n\n    def charge(self, idempotency_key: str, amount: int) -> int:\n        if idempotency_key in self.charged:\n            return self.charged[idempotency_key]\n        self.ledger.append((idempotency_key, amount))\n        self.charged[idempotency_key] = len(self.ledger)\n        return self.charged[idempotency_key]\n"
+      },
+      "input_tokens": 500,
+      "output_tokens": 120
+    },
+    {
+      "tool": "run_test",
+      "args": {},
+      "input_tokens": 300,
+      "output_tokens": 40
+    },
+    {
+      "finish": true,
+      "text": "Retry charges once per idempotency key.",
+      "input_tokens": 200,
+      "output_tokens": 30
+    }
+  ]
+}
