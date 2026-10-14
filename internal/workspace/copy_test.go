@@ -54,6 +54,45 @@ func TestMaterializeKeepsConfigModesAndSkipsDependencies(t *testing.T) {
 	_ = work
 }
 
+func TestMaterializeSkipsSecretFiles(t *testing.T) {
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, ".ssh", "id_rsa"), []byte("PRIVATE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, ".env"), []byte("TOKEN=hidden\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, ".env.example"), []byte("TOKEN=example\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, ".github"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, ".github", "workflows.yml"), []byte("name: ci\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	work, _, err := Materialize(src, t.TempDir(), "run_secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(work, ".env")); !os.IsNotExist(err) {
+		t.Fatalf(".env copied: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(work, ".ssh", "id_rsa")); !os.IsNotExist(err) {
+		t.Fatalf("key copied: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(work, ".env.example"))
+	if err != nil || string(body) != "TOKEN=example\n" {
+		t.Fatalf("example %q %v", body, err)
+	}
+	if _, err := os.Stat(filepath.Join(work, ".github", "workflows.yml")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMaterializeRejectsOversizedFile(t *testing.T) {
 	src := t.TempDir()
 	f, err := os.Create(filepath.Join(src, "big.bin"))

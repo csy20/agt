@@ -52,18 +52,7 @@ func (r *Runner) Exec(ctx context.Context, worktree, runID string, argv []string
 	if err != nil {
 		return "", "", 0, err
 	}
-	args := []string{
-		"exec",
-		"--user", user,
-		"-e", "HOME=/tmp",
-		"-e", "PYTHONDONTWRITEBYTECODE=1",
-		"-e", "PYTHONUNBUFFERED=1",
-		"-e", "PYTHONPATH=/workspace",
-		"-w", "/workspace",
-		containerName(runID),
-	}
-	args = append(args, argv...)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := dockerCommand(ctx, containerExecArgs(containerName(runID), user, argv)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -80,7 +69,7 @@ func (r *Runner) Exec(ctx context.Context, worktree, runID string, argv []string
 
 // Destroy removes the run container if it exists.
 func (r *Runner) Destroy(ctx context.Context, runID string) error {
-	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", containerName(runID))
+	cmd := dockerCommand(ctx, "rm", "-f", containerName(runID))
 	out, err := cmd.CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "No such container") {
 		return fmt.Errorf("docker rm: %w: %s", err, bytes.TrimSpace(out))
@@ -89,8 +78,8 @@ func (r *Runner) Destroy(ctx context.Context, runID string) error {
 }
 
 func (r *Runner) ensure(ctx context.Context, worktree, runID string) error {
-	if strings.Contains(worktree, ",") {
-		return fmt.Errorf("worktree path %q cannot be mounted", worktree)
+	if err := validateMountSource(worktree); err != nil {
+		return err
 	}
 	name := containerName(runID)
 	status, err := inspectStatus(ctx, name)
@@ -98,7 +87,7 @@ func (r *Runner) ensure(ctx context.Context, worktree, runID string) error {
 		return r.start(ctx, name, worktree, runID)
 	}
 	if status != "running" {
-		cmd := exec.CommandContext(ctx, "docker", "start", name)
+		cmd := dockerCommand(ctx, "start", name)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("docker start: %w: %s", err, bytes.TrimSpace(out))
@@ -112,29 +101,11 @@ func (r *Runner) start(ctx context.Context, name, worktree, runID string) error 
 	if err != nil {
 		return err
 	}
-	args := []string{
-		"run", "-d",
-		"--name", name,
-		"--label", "agt-run=" + runID,
-		"--network", "none",
-		"--read-only",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-		"--memory", "256m",
-		"--cpus", "1",
-		"--pids-limit", "64",
-		"--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges",
-		"--user", user,
-		"-e", "HOME=/tmp",
-		"-e", "PYTHONDONTWRITEBYTECODE=1",
-		"-w", "/workspace",
-		"--mount", "type=bind,src=" + worktree + ",dst=/workspace",
+	args, err := containerRunArgs(r.Image, name, worktree, runID, user, r.ExtraLabel)
+	if err != nil {
+		return err
 	}
-	if r.ExtraLabel != "" {
-		args = append(args, "--label", r.ExtraLabel)
-	}
-	args = append(args, r.Image, "sleep", "infinity")
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := dockerCommand(ctx, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker run: %w: %s", err, bytes.TrimSpace(out))
@@ -143,7 +114,7 @@ func (r *Runner) start(ctx context.Context, name, worktree, runID string) error 
 }
 
 func inspectStatus(ctx context.Context, name string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Status}}", name)
+	cmd := dockerCommand(ctx, "inspect", "--format", "{{.State.Status}}", name)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err

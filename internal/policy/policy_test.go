@@ -41,6 +41,30 @@ func TestReadAndPatchDecisions(t *testing.T) {
 	}
 }
 
+func TestSecretPathsAreDenied(t *testing.T) {
+	denied, err := Decide("read_file_range", json.RawMessage(`{"path":".env","start":1,"end":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if denied.Decision != Deny || !strings.Contains(denied.Reason, "secret") {
+		t.Fatalf("env decision %+v", denied)
+	}
+	nested, err := Decide("apply_patch", json.RawMessage(`{"path":".ssh/id_rsa","old":"a","new":"b"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nested.Decision != Deny {
+		t.Fatalf("key decision %+v", nested)
+	}
+	ok, err := Decide("read_file_range", json.RawMessage(`{"path":".env.example","start":1,"end":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok.Decision != Allow {
+		t.Fatalf("example decision %+v", ok)
+	}
+}
+
 func TestUnknownToolDenied(t *testing.T) {
 	res, err := Decide("shell", json.RawMessage(`{"cmd":"rm -rf /"}`))
 	if err != nil {

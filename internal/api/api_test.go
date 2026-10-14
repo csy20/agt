@@ -22,9 +22,11 @@ import (
 	"github.com/csy20/agt/internal/testutil"
 )
 
+const testToken = "test-token-value1"
+
 func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	st := testutil.Open(t)
-	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}).Handler())
+	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}, testToken).Handler())
 	t.Cleanup(ts.Close)
 
 	health, err := http.Get(ts.URL + "/healthz")
@@ -154,7 +156,7 @@ func TestApprovalHashIsBoundAndPushStaysUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 	version := cur.StateVersion
-	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}).Handler())
+	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}, testToken).Handler())
 	t.Cleanup(ts.Close)
 	wrong := postJSON(t, ts.URL+"/v1/runs/"+created.ID+"/approvals", map[string]any{
 		"command_id": "cmd_push",
@@ -253,6 +255,7 @@ func postJSON(t *testing.T, url string, body map[string]any, key string) respons
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	if key != "" {
 		req.Header.Set("Idempotency-Key", key)
 	}
@@ -265,7 +268,12 @@ func postJSON(t *testing.T, url string, body map[string]any, key string) respons
 
 func getJSON(t *testing.T, url string) map[string]any {
 	t.Helper()
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

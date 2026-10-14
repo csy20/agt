@@ -49,12 +49,12 @@ func unionFiles(base, work string) ([]string, error) {
 				return err
 			}
 			if d.IsDir() {
-				if d.Name() != "." && SkipDir(d.Name()) {
+				if d.Name() != "." && (SkipDir(d.Name()) || SecretDir(d.Name())) {
 					return filepath.SkipDir
 				}
 				return nil
 			}
-			if !d.Type().IsRegular() {
+			if !d.Type().IsRegular() || SecretFile(d.Name()) {
 				return nil
 			}
 			rel, err := filepath.Rel(root, path)

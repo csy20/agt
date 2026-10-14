@@ -56,9 +56,14 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err := decode(raw, &args); err != nil {
 			return denied(tool, raw, "invalid arguments"), nil
 		}
-		if _, err := tools.SafeRel(args.Path); err != nil {
+		rel, err := tools.SafeRel(args.Path)
+		if err != nil {
 			body, _ := json.Marshal(args)
 			return denied(tool, body, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			body, _ := json.Marshal(args)
+			return denied(tool, body, "secret paths are not available to the agent"), nil
 		}
 		if args.Start < 1 || args.End < args.Start || args.End-args.Start > 399 {
 			body, _ := json.Marshal(args)
@@ -88,9 +93,14 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err := decode(raw, &args); err != nil {
 			return denied(tool, raw, "invalid arguments"), nil
 		}
-		if _, err := tools.SafeRel(args.Path); err != nil {
+		rel, err := tools.SafeRel(args.Path)
+		if err != nil {
 			full, _ := json.Marshal(args)
 			return denied(tool, full, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			full, _ := json.Marshal(args)
+			return denied(tool, full, "secret paths are not available to the agent"), nil
 		}
 		if args.Old == "" || args.New == "" || len(args.Old) > 200_000 || len(args.New) > 200_000 {
 			body, _ := json.Marshal(args)

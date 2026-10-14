@@ -26,10 +26,11 @@ import (
 type Server struct {
 	Store  *store.Store
 	Config config.Config
+	Token  string
 }
 
-func New(st *store.Store, cfg config.Config) *Server {
-	return &Server{Store: st, Config: cfg}
+func New(st *store.Store, cfg config.Config, token string) *Server {
+	return &Server{Store: st, Config: cfg, Token: token}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -41,7 +42,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/runs/{id}/commands", s.listCommands)
 	mux.HandleFunc("GET /v1/runs/{id}/commands/{command_id}", s.getCommand)
 	mux.HandleFunc("POST /v1/runs/{id}/approvals", s.approve)
-	return mux
+	return s.guard(mux)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

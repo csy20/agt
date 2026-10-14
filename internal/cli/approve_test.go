@@ -14,6 +14,7 @@ import (
 func TestApproveAcceptsFlagsAfterIDs(t *testing.T) {
 	var got struct {
 		path string
+		auth string
 		body map[string]any
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -23,6 +24,7 @@ func TestApproveAcceptsFlagsAfterIDs(t *testing.T) {
 			_, _ = w.Write([]byte("ok\n"))
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run_1/approvals":
 			got.path = r.URL.Path
+			got.auth = r.Header.Get("Authorization")
 			defer r.Body.Close()
 			if err := json.NewDecoder(r.Body).Decode(&got.body); err != nil {
 				t.Errorf("decode: %v", err)
@@ -35,12 +37,16 @@ func TestApproveAcceptsFlagsAfterIDs(t *testing.T) {
 	}))
 	t.Cleanup(ts.Close)
 
+	t.Setenv("AGT_TOKEN", "test-token-value1")
 	code := Run([]string{"agt", "approve", "--server", ts.URL, "run_1", "cmd_1", "--args-hash", "abc123", "--decision", "approved"})
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
 	if got.path != "/v1/runs/run_1/approvals" {
 		t.Fatalf("path %q", got.path)
+	}
+	if got.auth != "Bearer test-token-value1" {
+		t.Fatalf("authorization %q", got.auth)
 	}
 	if got.body["command_id"] != "cmd_1" || got.body["args_hash"] != "abc123" || got.body["decision"] != "approved" {
 		t.Fatalf("body %#v", got.body)
@@ -113,6 +119,7 @@ func TestFixSendsAbsolutePathsFromAnotherDirectory(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	chdir(t, clientDir)
+	t.Setenv("AGT_TOKEN", "test-token-value1")
 	code := Run([]string{
 		"agt", "fix", "--server", ts.URL, "--provider", "fake", "--script", scriptRel,
 		"--repo", repoRel, "make the retry test pass",
@@ -204,6 +211,7 @@ func TestProviderFlagRespectsEnvironment(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	t.Setenv("AGT_PROVIDER", "openai")
+	t.Setenv("AGT_TOKEN", "test-token-value1")
 	code := Run([]string{"agt", "fix", "--server", ts.URL, "--repo", repo, "repair the test"})
 	if code == 2 {
 		t.Fatal("AGT_PROVIDER=openai was rejected")

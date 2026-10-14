@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/csy20/agt/internal/auth"
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/usage"
 	"github.com/csy20/agt/internal/version"
@@ -60,6 +61,7 @@ func usageText() {
 --provider defaults to AGT_PROVIDER. There is no silent provider.
 The fake provider is a labelled scripted demo, not a live model.
 The control plane is agtd. agt starts it when that binary sits beside agt and nothing is listening.
+agt sends the local token from AGT_TOKEN or $AGT_DATA_DIR/auth.token on every route except health.
 `)
 }
 
@@ -294,6 +296,10 @@ func attach(base, runID string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	if err := setAuth(req); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -467,7 +473,7 @@ func ensureServer(explicit string) (string, error) {
 
 func startDaemon(bin string) (*exec.Cmd, string, error) {
 	dataDir := config.Load().DataDir
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, "", fmt.Errorf("create data dir %s: %w", dataDir, err)
 	}
 	logPath := filepath.Join(dataDir, "agtd.log")
@@ -532,6 +538,9 @@ func postJSON(url string, body any, dest any) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "idem_"+strconv.FormatInt(time.Now().UnixNano(), 36))
+	if err := setAuth(req); err != nil {
+		return err
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -558,7 +567,14 @@ func postJSON(url string, body any, dest any) error {
 }
 
 func getJSON(url string, dest any) error {
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if err := setAuth(req); err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -571,6 +587,16 @@ func getJSON(url string, dest any) error {
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	return json.Unmarshal(data, dest)
+}
+
+func setAuth(req *http.Request) error {
+	dir := config.Load().DataDir
+	token, err := auth.Read(dir)
+	if err != nil {
+		return fmt.Errorf("local API token: %w. Set the same AGT_DATA_DIR or AGT_TOKEN as agtd", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	return nil
 }
 
 func errorsIsEOF(err error) bool {

@@ -27,12 +27,13 @@ test: up image
 
 demo: build up image
 	mkdir -p /tmp/agt-demo
+	chmod 700 /tmp/agt-demo
 	AGT_DATA_DIR=/tmp/agt-demo ./$(BIN_DIR)/agtd$(EXE) >/tmp/agtd.log 2>&1 & echo $$! >/tmp/agtd.pid
 	i=0; \
 	until curl -sf http://127.0.0.1:8787/healthz >/dev/null || [ $$i -ge 40 ]; do \
 		i=$$((i+1)); sleep 0.25; \
 	done
-	./$(BIN_DIR)/agt$(EXE) fix --repo eval/fixtures/payrepo --provider fake --script eval/scripts/fix_retry.json "make the retry test pass"; \
+	AGT_DATA_DIR=/tmp/agt-demo ./$(BIN_DIR)/agt$(EXE) fix --repo eval/fixtures/payrepo --provider fake --script eval/scripts/fix_retry.json "make the retry test pass"; \
 	status=$$?; \
 	kill $$(cat /tmp/agtd.pid) >/dev/null 2>&1 || true; \
 	exit $$status

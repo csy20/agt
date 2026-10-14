@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/csy20/agt/internal/api"
+	"github.com/csy20/agt/internal/auth"
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/diag"
 	"github.com/csy20/agt/internal/model"
@@ -30,8 +31,21 @@ func main() {
 func run() int {
 	cfg := config.Load()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	if err := config.ValidateListenAddr(cfg.ListenAddr); err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		slog.Error("data dir", "err", err)
+		return 1
+	}
+	token, err := auth.LoadOrCreate(cfg.DataDir)
+	if err != nil {
+		slog.Error("local token", "err", err)
+		return 1
+	}
+	if token == "" {
+		slog.Error("local token is empty")
 		return 1
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -94,7 +108,7 @@ func run() int {
 	go worker.Loop(ctx)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.New(st, cfg).Handler(),
+		Handler:           api.New(st, cfg, token).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

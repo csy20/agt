@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"fmt"
 	"io/fs"
 	"os"
@@ -23,19 +24,19 @@ func Search(root, query string) (string, error) {
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if name != "." && SkipDir(name) {
+			if name != "." && (SkipDir(name) || SecretDir(name)) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !d.Type().IsRegular() {
+		if !d.Type().IsRegular() || SecretFile(name) {
 			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		if len(data) > maxReadBytes {
+		if len(data) > maxReadBytes || bytes.Contains(data, []byte{0}) {
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)
@@ -65,7 +66,14 @@ func Search(root, query string) (string, error) {
 
 // ReadRange returns 1-based inclusive lines.
 func ReadRange(root, rel string, start, end int) (string, error) {
-	full, err := Within(root, rel)
+	clean, err := SafeRel(rel)
+	if err != nil {
+		return "", err
+	}
+	if SecretRel(clean) {
+		return "", fmt.Errorf("secret paths are not available to the agent")
+	}
+	full, err := Within(root, clean)
 	if err != nil {
 		return "", err
 	}
@@ -96,7 +104,14 @@ func ReadRange(root, rel string, start, end int) (string, error) {
 // Patch replaces old with new exactly once. A second call with the same
 // arguments reports already applied and does not write.
 func Patch(root, rel, old, new string) (string, error) {
-	full, err := Within(root, rel)
+	clean, err := SafeRel(rel)
+	if err != nil {
+		return "", err
+	}
+	if SecretRel(clean) {
+		return "", fmt.Errorf("secret paths are not available to the agent")
+	}
+	full, err := Within(root, clean)
 	if err != nil {
 		return "", err
 	}

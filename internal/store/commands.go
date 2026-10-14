@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/csy20/agt/internal/redact"
 	"github.com/csy20/agt/internal/run"
 	"github.com/jackc/pgx/v5"
 )
@@ -184,7 +185,7 @@ func insertIntentCommand(ctx context.Context, tx pgx.Tx, runID string, in Intent
 		result = string(body)
 		eventType = "command.finished"
 		payload["exit_code"] = 2
-		payload["output_excerpt"] = clip(in.Reason, 500)
+		payload["output_excerpt"] = clip(redact.Text(in.Reason), 500)
 	case "require_approval":
 		state = "awaiting_approval"
 		eventType = "approval.requested"
@@ -276,7 +277,7 @@ func (s *Store) RecordSystemCommand(ctx context.Context, runID, commandID, tool,
 		}
 		_, err := appendEvent(ctx, tx, runID, "command.finished", "system", "verifier", map[string]any{
 			"command_id": commandID, "tool": tool, "decision": "allow", "args_hash": argsHash,
-			"exit_code": exitCode, "output_excerpt": clip(output, 500),
+			"exit_code": exitCode, "output_excerpt": clip(redact.Text(output), 500),
 		})
 		return err
 	})

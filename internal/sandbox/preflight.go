@@ -32,10 +32,10 @@ func preflight(ctx context.Context, image string) error {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return fmt.Errorf("docker was not found on PATH. Install Docker and start its daemon. agt runs tests only inside a container and does not fall back to the host")
 	}
-	if out, err := exec.CommandContext(ctx, "docker", "info").CombinedOutput(); err != nil {
+	if out, err := dockerCommand(ctx, "info").CombinedOutput(); err != nil {
 		return fmt.Errorf("docker is installed but the daemon is not reachable. Start Docker and retry. %s", clipOut(out))
 	}
-	if out, err := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", image).CombinedOutput(); err != nil {
+	if out, err := dockerCommand(ctx, "image", "inspect", "--format", "{{.Id}}", image).CombinedOutput(); err != nil {
 		return fmt.Errorf("sandbox image %q is not available. Build it with `make image` or set AGT_SANDBOX_IMAGE to an image that exists. %s", image, clipOut(out))
 	}
 	return nil

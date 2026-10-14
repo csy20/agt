@@ -12,6 +12,7 @@ import (
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/model"
 	"github.com/csy20/agt/internal/policy"
+	"github.com/csy20/agt/internal/redact"
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/telemetry"
@@ -253,7 +254,7 @@ func (o *Orchestrator) executeOpen(ctx context.Context, current store.Run) error
 	}
 	_, _ = o.store.AppendEvent(ctx, current.ID, "command.finished", "tool", cmd.Tool, map[string]any{
 		"command_id": cmd.CommandID, "tool": cmd.Tool, "exit_code": code,
-		"output_excerpt": clip(output, 500), "args_hash": cmd.ArgsHash,
+		"output_excerpt": modelText(output, 500), "args_hash": cmd.ArgsHash,
 	})
 	fresh, err := o.store.GetRun(ctx, current.ID)
 	if err != nil {
@@ -414,7 +415,7 @@ func (o *Orchestrator) observations(ctx context.Context, runID string) ([]model.
 			Tool:   cmd.Tool,
 			Origin: "tool:" + cmd.Tool,
 			Exit:   result.ExitCode,
-			Output: clip(result.Output, 4000),
+			Output: modelText(result.Output, 4000),
 		})
 	}
 	if len(out) > 6 {
@@ -474,6 +475,12 @@ func (o *Orchestrator) flush(ctx context.Context, current store.Run) {
 	o.mu.Lock()
 	o.mark[current.ID] = last
 	o.mu.Unlock()
+}
+
+// modelText redacts secrets before a tool result is given to the model
+// or copied into an event excerpt. The command row keeps the original text.
+func modelText(s string, n int) string {
+	return clip(redact.Text(s), n)
 }
 
 func clip(s string, n int) string {

@@ -3,23 +3,30 @@ package tools
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
 
 // SafeRel accepts a repository-relative path and rejects escapes.
-func SafeRel(path string) (string, error) {
-	if path == "" || strings.Contains(path, "\x00") {
+// Backslashes are separators. A colon is rejected so a Windows drive,
+// a UNC path, or an alternate data stream cannot be addressed.
+func SafeRel(p string) (string, error) {
+	if p == "" || strings.Contains(p, "\x00") {
 		return "", fmt.Errorf("path is empty")
 	}
-	if filepath.IsAbs(path) {
+	if strings.Contains(p, ":") {
+		return "", fmt.Errorf("path is outside the worktree")
+	}
+	slash := strings.ReplaceAll(p, "\\", "/")
+	if strings.HasPrefix(slash, "/") || filepath.IsAbs(p) {
 		return "", fmt.Errorf("absolute paths are outside the worktree")
 	}
-	clean := filepath.Clean(path)
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+	clean := path.Clean(slash)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
 		return "", fmt.Errorf("path escapes the worktree")
 	}
-	return clean, nil
+	return filepath.FromSlash(clean), nil
 }
 
 // Within resolves rel inside root and refuses symlink escapes.

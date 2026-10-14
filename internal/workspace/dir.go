@@ -126,7 +126,8 @@ const MaxCopyFileBytes = 8 << 20
 // Materialize copies repo into dataDir/runs/<id>/{work,base}.
 // Symlinks are refused. Executable bits are preserved.
 // Dotfiles and dot-directories are included except the directory names
-// reported by tools.SkipDir (.git, node_modules, build outputs, and similar).
+// reported by tools.SkipDir (.git, node_modules, build outputs, and similar)
+// and secret names such as .env, .ssh, and private keys. .env.example is copied.
 func Materialize(repo, dataDir, runID string) (work, base string, err error) {
 	root := filepath.Join(dataDir, "runs", runID)
 	if err := os.RemoveAll(root); err != nil {
@@ -164,12 +165,12 @@ func copyTree(src, dst string) error {
 			return err
 		}
 		if d.IsDir() {
-			if rel != "." && tools.SkipDir(d.Name()) {
+			if rel != "." && (tools.SkipDir(d.Name()) || tools.SecretDir(d.Name())) {
 				return filepath.SkipDir
 			}
 			return os.MkdirAll(target, 0o755)
 		}
-		if !d.Type().IsRegular() {
+		if !d.Type().IsRegular() || tools.SecretFile(d.Name()) {
 			return nil
 		}
 		if info.Size() > MaxCopyFileBytes {
