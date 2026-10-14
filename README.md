@@ -20,14 +20,21 @@ With Postgres and `agtd` already running:
 
 `--profile` is required. `--repo` does not choose a language or a test command. `agt profile detect --repo PATH` prints a suggestion and does not start a run. The same flags work for the Go fixture (`--profile go --test-arg go --test-arg test --test-arg ./...`, repo `eval/fixtures/gocounter`) and the JavaScript fixture (`--profile javascript --test-arg node --test-arg --test`, repo `eval/fixtures/jsquote`). `typescript` is an alias of the JavaScript profile. These profiles do not install dependencies: the network stays disabled and the image already contains the toolchain.
 
-Reattach after the client exits. Leaving `attach` does not cancel the run and does not apply the change:
+Reattach after the client exits. Leaving `attach` does not cancel the run and does not apply the change. `agt run cancel` does. `agt run pause` and `agt run resume` stop and continue a run. `agt run budget-resume` continues a run that stopped for budget, and `--budget-cents` may raise that cap. `agt run cleanup` removes sandbox containers for finished, paused, cancelled, or missing runs. It does not delete the data directory or a container whose run is still executing.
 
 ```sh
 ./bin/agt run attach RUN_ID
+./bin/agt run pause RUN_ID
+./bin/agt run resume RUN_ID
+./bin/agt run budget-resume RUN_ID --budget-cents N
+./bin/agt run cancel RUN_ID
+./bin/agt run cleanup
 ./bin/agt run diff RUN_ID
 ./bin/agt run export RUN_ID --output patch.json
 ./bin/agt run apply RUN_ID --digest DIGEST
 ```
+
+A cost budget is checked before the next model request, using an estimate of the prepared text plus a reserved output of 2048 tokens, and the reported usage is recorded afterward. That is not a hard dollar cap. Prices of zero, or a provider that does not report usage, do not enforce one. The same limit is not a promise of exactly-once tool execution: `apply_patch` can be applied again safely, and `write_file` and `delete_file` require the previous hash.
 
 `agt run apply` without `--digest` prints the diff, the file operations, and the digest, then exits 2. The daemon rebuilds the patch from the run snapshot and writes only the repository stored for that run. The source tree stays unchanged until that command is authorized. A stale file, or a digest that does not match, writes nothing.
 

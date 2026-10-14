@@ -63,6 +63,11 @@ func usageText() {
   agt run diff RUN
   agt run export RUN --output FILE
   agt run apply RUN --digest DIGEST
+  agt run pause RUN
+  agt run resume RUN
+  agt run budget-resume RUN [--budget-cents N]
+  agt run cancel RUN
+  agt run cleanup
   agt approve RUN COMMAND --args-hash HASH
   agt version
 
@@ -72,7 +77,9 @@ agt profile detect prints a suggestion and does not start a run.
 The fake provider is a labelled scripted demo, not a live model.
 The control plane is agtd. agt starts it when that binary sits beside agt and nothing is listening.
 agt sends the local token from AGT_TOKEN or $AGT_DATA_DIR/auth.token on every route except health.
-agt run diff and agt run export review the snapshot. agt run apply writes the source repository only after --digest matches that artifact. Leaving attach does not apply the change.
+agt run diff and agt run export review the snapshot. agt run apply writes the source repository only after --digest matches that artifact.
+Leaving agt run attach does not cancel the run and does not apply the change. agt run cancel does.
+A dollar cap is not enforced when model prices are zero or the provider reports no usage.
 `)
 }
 
@@ -173,6 +180,16 @@ func runCmd(args []string) int {
 		return exportCmd(args[1:])
 	case "apply":
 		return applyCmd(args[1:])
+	case "pause":
+		return lifecycleCmd("pause", args[1:])
+	case "resume":
+		return lifecycleCmd("resume", args[1:])
+	case "budget-resume":
+		return budgetResumeCmd(args[1:])
+	case "cancel":
+		return lifecycleCmd("cancel", args[1:])
+	case "cleanup":
+		return lifecycleCmd("cleanup", args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown run command %q\n", args[0])
 		return 2

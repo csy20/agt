@@ -21,6 +21,17 @@ const (
 	FailedTerminal  State = "FAILED_TERMINAL"
 )
 
+// Quiescent reports states where the worker should finish its job.
+// A later resume enqueues a new job. EXECUTING and VERIFYING are not quiescent.
+func Quiescent(s State) bool {
+	switch s {
+	case AwaitingApproval, Paused, PausedBudget, Cancelled, Succeeded, FailedTerminal:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsTerminal reports states that no worker should leave.
 func IsTerminal(s State) bool {
 	switch s {

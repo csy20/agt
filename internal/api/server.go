@@ -31,6 +31,9 @@ type Server struct {
 	Store  *store.Store
 	Config config.Config
 	Token  string
+	// Cleanup removes abandoned sandbox containers. The API does not import
+	// the sandbox package; the daemon injects this.
+	Cleanup func(context.Context) (int, error)
 }
 
 func New(st *store.Store, cfg config.Config, token string) *Server {
@@ -49,6 +52,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/runs/{id}/diff", s.diff)
 	mux.HandleFunc("GET /v1/runs/{id}/patch", s.patchArtifact)
 	mux.HandleFunc("POST /v1/runs/{id}/apply", s.apply)
+	mux.HandleFunc("POST /v1/runs/{id}/pause", s.pause)
+	mux.HandleFunc("POST /v1/runs/{id}/resume", s.resume)
+	mux.HandleFunc("POST /v1/runs/{id}/budget-resume", s.budgetResume)
+	mux.HandleFunc("POST /v1/runs/{id}/cancel", s.cancel)
+	mux.HandleFunc("POST /v1/cleanup", s.cleanup)
 	return s.guard(mux)
 }
 

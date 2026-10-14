@@ -1,6 +1,6 @@
 # AGT status
 
-Updated 14 October 2026 on branch `milestone-5-review`, based on `milestone-4-repair` at `7448990`.
+Updated 14 October 2026 on branch `milestone-6-lifecycle`, based on `milestone-5-review` at `313bac6`.
 This file records what the code and the checks actually show. A passing fake-provider demo is not a live-model repair. A cross-compile is not native execution. A skipped integration test is not support.
 
 ## Milestone 1
@@ -46,7 +46,7 @@ The Go profile env sets `GOPROXY=off`, `GOSUMDB=off`, `GOTOOLCHAIN=local`, and `
 
 ## Milestone 4
 
-Implemented on this branch. The model proposes one action. The supervisor decides whether verification may continue. Repository text stays out of the system prompt.
+Implemented on `milestone-4-repair` at `7448990` and still present here. The model proposes one action. The supervisor decides whether verification may continue. Repository text stays out of the system prompt.
 
 | Control | Where | Check |
 |---|---|---|
@@ -66,7 +66,7 @@ Implemented on this branch. The model proposes one action. The supervisor decide
 
 ## Milestone 5
 
-Implemented on this branch. The workspace is a filesystem snapshot plus a `patch.v1` artifact. It is not a Git worktree. `COMMITTING` is still not a Git commit. The supervisor does not apply the artifact to the source repository.
+Implemented on `milestone-5-review` at `313bac6` and still present here. The workspace is a filesystem snapshot plus a `patch.v1` artifact. It is not a Git worktree. `COMMITTING` is still not a Git commit. The supervisor does not apply the artifact to the source repository.
 
 | Control | Where | Check |
 |---|---|---|
@@ -77,13 +77,28 @@ Implemented on this branch. The workspace is a filesystem snapshot plus a `patch
 
 `TestReviewedApplyUpdatesACopyAndRejectsAStalePatch` repaired a copy of `eval/fixtures/payrepo` with the fake provider and `agt-sandbox:python`. The copy and the fixture stayed unchanged until `patch.Apply`. The apply wrote the charge fix. A later edit to that file made a second apply return a conflict and left the newer bytes in place. `eval/fixtures` was not modified. An approved test-file edit followed by passing verification was still not integration-tested.
 
+## Milestone 6
+
+Implemented on this branch. A worker renews its job lease and can stop a run without another worker replaying a stolen job. Pause, resume, cancel, and budget resume are explicit. Leaving `agt run attach` is still not cancel. The snapshot apply is unchanged.
+
+| Control | Where | Check |
+|---|---|---|
+| Migration `004_lease.sql` adds `run_jobs.fence`, `usage_entries.model_name`, and `usage_entries.profile_name`, and a unique partial index so one run has at most one queued or claimed job. `Migrate` takes transaction lock `8675310`, rechecks `schema_migrations`, and skips a version another starter already applied. The test harness lock remains `8675309` on a different connection | `internal/store/migrations/004_lease.sql`, `internal/store/store.go` | `TestMigrateIsSafeWhenCalledTogether` |
+| Claim increments the fence and sets a 30-second lease. Renew, finish, and release match owner and fence. A second claim after `ExpireLease` gets the next fence. The previous owner cannot finish, release, or renew. `FinishIfQuiescent` locks the run first and finishes the job only in `AWAITING_APPROVAL`, `PAUSED`, `PAUSED_BUDGET`, `CANCELLED`, `SUCCEEDED`, or `FAILED_TERMINAL`. A duplicate enqueue is a no-op | `internal/store/commands.go`, `internal/orch/worker.go` | `TestLeaseFenceStopsAStaleWorker` |
+| The worker renews every 10 seconds and polls the run about once a second. `PAUSED`, `PAUSED_BUDGET`, and `CANCELLED` cancel the run context with `ErrPaused`. The orchestrator closes the sandbox with a 20-second cleanup context and returns success so the job can finish. A lost lease returns `ErrLeaseLost` and does not close the container or release the job. `ErrInterrupt` still leaves the command pending and, on the worker path, requeues only while the fence matches. A process signal requeues only while the fence matches | `internal/orch/worker.go`, `internal/orch/orch.go` | `TestResumeDoesNotDoubleApplyPatch` still interrupts inside `apply_patch`, leaves one patch, and reaches `SUCCEEDED` with `already applied` |
+| Before `Complete`, the orchestrator estimates input tokens and reserves 2048 output tokens. When that estimate would exceed the budget and a price is non-zero, it pauses at `PAUSED_BUDGET` and does not call the model. The estimate is not a usage row. Reported cost is still recorded after the call. Both prices at zero skip the reserve. A run deadline on the step context becomes `PAUSED_BUDGET` with reason `deadline` instead of `FAILED_TERMINAL`. Max steps pause and close the sandbox. A verification return to `OBSERVING` still does not close it | `internal/orch/orch.go`, `internal/model/openai.go` | `TestBudgetPauseBeforeSideEffects` still has no worktree, no commands, and no execs at budget 0. `TestOpenAIRetriesRateLimitOnce` records two attempts |
+| Usage rows store the configured model name and profile name. `model.http_attempts` is written when the provider reports more than one HTTP request. `FinishCommand` records `sandbox.test_runs` for a model-requested `run_test`. The verifier still records its own row in `RecordSystemCommand`. A failed model call that exhausted retries records attempts when the context is still active | `internal/store/commands.go`, `internal/model/provider.go` | `TestUsageRecordsModelProfileAndTestRuns` |
+| `POST /v1/runs/{id}/pause`, `/resume`, `/budget-resume`, and `/cancel`, plus `POST /v1/cleanup`. Resume from `PAUSED` and budget resume from `PAUSED_BUDGET` go to `PLANNING` and enqueue. A lower `budget_cents` is 400. An unknown field is 400. An illegal or terminal transition is 409. Cleanup is injected by `agtd`; the API does not import the sandbox. `ShouldSweep` removes containers for succeeded, failed terminal, paused, paused for budget, cancelled, or missing runs. It does not remove `EXECUTING`, `VERIFYING`, or other live states. A lookup error skips that container. Startup sweeps after preflight, logs a failure, and continues | `internal/api/lifecycle.go`, `internal/sandbox/sweep.go`, `cmd/agtd/main.go`, `internal/cli/lifecycle.go` | `TestPauseResumeCancelAndCleanup`, `TestRunLifecyclePostsTheRunAndLeavesAttachAsDetach`, `TestShouldSweepLeavesLiveWork`, `TestParseRunLabels` |
+
+`apply_patch` remains idempotent. `write_file` and `delete_file` remain hash-preconditioned. This milestone does not promise exactly-once execution for an arbitrary command. A hosted model was not called. An approved test-file edit followed by passing verification was still not integration-tested.
+
 ## Checks run on this machine
 
 Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 via `deploy/compose.yaml` on `127.0.0.1:54329`.
 
-- `go test ./...` passed with `AGT_DATABASE_URL` set and `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, and `AGT_IMAGE_NODE` set to the existing tags `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`. This run did not rebuild those images. `internal/api` passed in about 18 seconds, `internal/store` in about 20 seconds, `internal/orch` in about 75 seconds, and `internal/sandbox` in about 5 seconds. The orchestrator package included the repair-loop tests, `TestLoopbackAdapterRepairsPayrepo`, and `TestReviewedApplyUpdatesACopyAndRejectsAStalePatch`. The source fixtures were unchanged.
-- `make test` and `make demo` were not re-run on this branch. The Milestone 3 demo still applies to the fake-provider path: it exited 0 with `AGT_DATA_DIR=/tmp/agt-demo`, token mode `600`, directory mode `700`, `--profile python`, and run id `run_0c3fc8d8e0165c95`. That demo is not the loopback adapter test.
-- `CGO_ENABLED=0` `go test -c` for `windows/amd64`, `darwin/amd64`, `darwin/arm64`, and `linux/arm64` succeeded for `internal/api`, `internal/cli`, `internal/orch`, `internal/patch`, and `internal/workspace`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The scratch binaries were deleted. `internal/auth` was not cross-compiled on this branch. The Linux amd64 binaries used by `go test` were executed.
+- `go test ./...` passed. `AGT_DATABASE_URL` was unset, so the tests used the default URL `postgres://agt:agt@127.0.0.1:54329/agt?sslmode=disable` and Postgres was up. `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, and `AGT_IMAGE_NODE` were the existing tags `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`. This run did not rebuild those images. `internal/api` passed in about 23 seconds, `internal/store` in about 28 seconds, `internal/orch` in about 79 seconds, and `internal/sandbox` in about 5 seconds. The orchestrator package included the repair-loop tests, `TestLoopbackAdapterRepairsPayrepo`, `TestReviewedApplyUpdatesACopyAndRejectsAStalePatch`, `TestBudgetPauseBeforeSideEffects`, and `TestResumeDoesNotDoubleApplyPatch`. The source fixtures were unchanged.
+- `make test` and `make demo` were not re-run on this branch. The Milestone 3 demo still applies to the fake-provider path: it exited 0 with `AGT_DATA_DIR=/tmp/agt-demo`, token mode `600`, directory mode `700`, `--profile python`, and run id `run_0c3fc8d8e0165c95`. That demo is not the loopback adapter test and was not repeated here.
+- `CGO_ENABLED=0` `go test -c` for `windows/amd64`, `darwin/amd64`, `darwin/arm64`, and `linux/arm64` succeeded for `internal/api`, `internal/cli`, `internal/orch`, `internal/store`, `internal/sandbox`, `internal/model`, and `internal/run`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The 36 scratch binaries were deleted. `internal/auth`, `internal/patch`, and `internal/workspace` were not cross-compiled on this branch. The Linux amd64 binaries used by `go test` were executed.
 
 `internal/testutil.Open` still skips when Postgres is unreachable and `AGT_DATABASE_URL` is unset. That skip is not evidence of database support. `make test` sets the URL and fails if Postgres is down. A `go test` that does not export the three image variables may use the host runner. Do not record that run as container support.
 
@@ -91,16 +106,16 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 
 | Area | State | Evidence |
 |---|---|---|
-| CLI fix / run / approve / version | Partial | Commands above work and send the local token. `fix` and `run create` require `--profile`. `profile detect` only suggests. `run diff`, `run export`, and `run apply` review or write the recorded repository. No run list, cancel, pause, or resume |
-| Daemon and API | Partial | Health is open. Other routes require the local token. Listen is loopback-only. Postgres required. Create rejects a missing profile, a client-supplied image, and a repository nested with the data directory. Diff, patch, and apply are local and digest-bound |
-| Run lifecycle | Partial | States and compare-and-swap exist. `COMMITTING` is not a Git commit. Several states have no user workflow |
-| Persistence | Partial | `001_init.sql`, `002_profile.sql` (`profile_json`), and `003_transcript.sql` (`model_messages`). Job leases are still 30 seconds and are not renewed |
+| CLI fix / run / approve / version | Partial | Commands above work and send the local token. `fix` and `run create` require `--profile`. `profile detect` only suggests. `run diff`, `run export`, and `run apply` review or write the recorded repository. `run pause`, `run resume`, `run budget-resume`, `run cancel`, and `run cleanup` call the daemon. There is no run list |
+| Daemon and API | Partial | Health is open. Other routes require the local token. Listen is loopback-only. Postgres required. Create rejects a missing profile, a client-supplied image, and a repository nested with the data directory. Diff, patch, and apply are local and digest-bound. Pause, resume, budget resume, cancel, and cleanup are explicit |
+| Run lifecycle | Partial | States and compare-and-swap exist. `COMMITTING` is not a Git commit. Pause, resume, budget resume, and cancel are user commands. A job fence blocks a stale worker from releasing a stolen job. Leaving `attach` is not cancel |
+| Persistence | Partial | `001_init.sql`, `002_profile.sql` (`profile_json`), `003_transcript.sql` (`model_messages`), and `004_lease.sql` (fence, usage identity, one active job). Leases last 30 seconds and are renewed about every 10 seconds |
 | Agent loop | Partial | A failing verification can return to the model while budget remains. `TestLoopbackAdapterRepairsPayrepo` repaired payrepo through a local OpenAI-compatible server. Fake-provider fixtures remain demos. No hosted-model run |
 | Tools | Partial | Search, read, exact replace, hash-preconditioned write and delete, in-process diff. The test argv comes from the profile. Secret paths are denied |
 | Policy | Partial | Allow, deny, and approval hashing remain. Push and pull request are denied. Secret paths and escapes are denied for write and delete. Test-file edits require approval |
 | Isolation | Partial on Linux | Three per-language images, one workspace mount, no network, dropped capabilities, resource limits from the profile, filtered docker CLI environment, host uid on Linux. `/tmp` is executable and `nosuid`. Windows user id is selected in code and was not run |
 | Model adapter | Partial | OpenAI-compatible chat completions, one streamed tool call, a single capability fallback, and retries for 429 and 5xx. A loopback base URL may omit the API key. A cloud URL requires it. More than one tool call is rejected. A hosted model was not called |
-| Accounting | Partial | Token estimate after the model call. Not a hard spend cap |
+| Accounting | Partial | A pre-request estimate can pause before the model call when a price is non-zero. Reported usage is stored with model and profile names. HTTP retries and `run_test` executions are counted. This is not a hard dollar cap when prices are zero or usage is unreported |
 | Tests | Partial | Unit and Linux Docker/Postgres checks above. Three scripted repair fixtures, the verification-return and loopback adapter tests, and a reviewed apply against a copy of payrepo |
 | Telemetry | Partial | JSON logs and optional OTLP. Not a quality measure |
 | Windows native | Unverified | Cross-compile, including the junction test in `internal/tools`. ACL code was cross-compiled in Milestone 2 and was not executed. No Windows execution |
@@ -110,14 +125,14 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 
 ## Not in this branch
 
-Milestones 6–8 from the 14 October 2026 audit are not done. In particular: lease renewal, cancel, pause, and resume, installable release artifacts, and an evaluation set of unfamiliar tasks. The loopback adapter test is a local OpenAI-compatible server. It is not evidence that a hosted model repaired a repository. The fake-provider fixtures remain labelled demos. A reviewed apply is not an automatic apply, and it is not a Git commit.
+Milestones 7 and 8 from the 14 October 2026 audit are not done. In particular: an installable terminal workflow and an evaluation set of unfamiliar tasks. The loopback adapter test is a local OpenAI-compatible server. It is not evidence that a hosted model repaired a repository. The fake-provider fixtures remain labelled demos. A reviewed apply is not an automatic apply, and it is not a Git commit. Lease renewal does not make tool execution exactly-once. A cost budget is not a hard dollar cap when prices are zero or the provider reports no usage.
 
 The roadmap is not complete.
 
 ## Handoff
 
-Stay on `milestone-5-review` or branch from it. Do not push unless asked.
+Stay on `milestone-6-lifecycle` or branch from it. Do not push unless asked.
 
-Milestone 6 next: renew job leases, fence completion, and add cancel, pause, resume, and budget resume. Keep the snapshot apply explicit. Do not treat the fake-provider fixtures as a hosted-model run.
+Milestone 7 next: a usable terminal workflow that starts from an existing shell, shows the review, and applies only when the user asks. Keep the snapshot apply explicit. Do not treat the fake-provider fixtures as a hosted-model run.
 
 The Windows ACL and junction tests still need a Windows run before those controls can be called supported. macOS and linux/arm64 were not executed.

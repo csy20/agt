@@ -187,6 +187,7 @@ func (c *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 	}
 	useMinimal := false
 	var last error
+	posts := 0
 	for try := 0; try < attempts; try++ {
 		if err := ctx.Err(); err != nil {
 			return Response{}, err
@@ -201,6 +202,7 @@ func (c *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 			payload = minimal
 		}
 		status, raw, err := c.post(ctx, payload)
+		posts++
 		if err != nil {
 			if ctx.Err() != nil {
 				return Response{}, ctx.Err()
@@ -225,12 +227,13 @@ func (c *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 			return Response{}, err
 		}
 		parsed.ModelName = c.Model
+		parsed.Attempts = posts
 		return parsed, nil
 	}
 	if last == nil {
 		last = fmt.Errorf("model request failed")
 	}
-	return Response{}, last
+	return Response{}, &StatusError{Attempts: posts, Model: c.Model, Err: last}
 }
 
 func (c *OpenAI) maxOutput() int {

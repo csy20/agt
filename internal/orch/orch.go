@@ -18,6 +18,7 @@ import (
 	"github.com/csy20/agt/internal/model"
 	"github.com/csy20/agt/internal/patch"
 	"github.com/csy20/agt/internal/policy"
+	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/redact"
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
@@ -32,7 +33,17 @@ var (
 	ErrHalt = errors.New("halted")
 	// ErrInterrupt leaves a pending command so another worker can resume it.
 	ErrInterrupt = errors.New("worker interrupted")
+	// ErrPaused means a human, budget, or cancel stop should close the sandbox
+	// and finish the job without requeueing the run.
+	ErrPaused = errors.New("run paused")
+	// ErrLeaseLost means another worker holds the job. Do not release it or
+	// destroy the sandbox; the name is shared with the new owner.
+	ErrLeaseLost = errors.New("lease lost")
 )
+
+// reservedOutputTokens matches the OpenAI adapter default when a request does
+// not set a smaller cap. It is an estimate, not a provider guarantee.
+const reservedOutputTokens = 2048
 
 type Hooks struct {
 	// BeforeResult runs after a tool side effect and before the result is recorded.
@@ -84,8 +95,8 @@ func New(opts Options) *Orchestrator {
 // Run advances one run until it stops, succeeds, or the worker is interrupted.
 func (o *Orchestrator) Run(ctx context.Context, runID string) error {
 	for i := 0; i < 64; i++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return o.onStop(ctx, runID, err)
 		}
 		current, err := o.store.GetRun(ctx, runID)
 		if err != nil {
@@ -93,71 +104,25 @@ func (o *Orchestrator) Run(ctx context.Context, runID string) error {
 		}
 		o.flush(ctx, current)
 		if run.IsTerminal(current.State) {
-			_ = o.close(ctx, runID)
+			_ = o.closeBounded(runID)
 			return nil
 		}
 		if !current.Deadline.IsZero() && time.Now().After(current.Deadline) && current.State != run.PausedBudget && current.State != run.Paused {
-			if err := o.close(ctx, runID); err != nil {
-				return o.fail(ctx, current, err)
-			}
-			if _, err := o.store.Transition(ctx, runID, current.StateVersion, run.PausedBudget, "deadline"); err != nil {
-				return err
-			}
-			return nil
+			return o.deadlineStop(ctx, current)
 		}
-		if err := o.executeOpen(ctx, current); err != nil {
-			if errors.Is(err, ErrHalt) {
-				return nil
-			}
-			if errors.Is(err, ErrInterrupt) {
-				return err
-			}
-			return o.fail(ctx, current, err)
+		stepCtx, cancelStep := stepContext(ctx, current)
+		err = o.executeOpen(stepCtx, current)
+		if err == nil {
+			current, err = o.store.GetRun(stepCtx, runID)
 		}
-		current, err = o.store.GetRun(ctx, runID)
-		if err != nil {
-			return err
+		if err == nil && !run.IsTerminal(current.State) {
+			err = o.dispatch(stepCtx, current)
 		}
-		if run.IsTerminal(current.State) {
-			_ = o.close(ctx, runID)
-			return nil
-		}
-		switch current.State {
-		case run.AwaitingApproval, run.Paused, run.PausedBudget:
-			return nil
-		case run.Created:
-			_, err = o.store.Transition(ctx, runID, current.StateVersion, run.Contextualising, "orchestrator")
-		case run.Contextualising:
-			err = o.seedContext(ctx, current)
-		case run.Planning, run.Observing:
-			err = o.modelTurn(ctx, current)
-		case run.Verifying:
-			err = o.verify(ctx, current)
-		case run.Executing:
-			_, openErr := o.store.OpenCommand(ctx, runID)
-			if errors.Is(openErr, store.ErrNotFound) {
-				_, err = o.store.Transition(ctx, runID, current.StateVersion, run.Observing, "orchestrator")
-			}
-		case run.Committing:
-			// Destroy the sandbox before the terminal state is visible, so a
-			// client that disconnects on success cannot interrupt cleanup.
-			if err := o.close(ctx, runID); err != nil {
-				return o.fail(ctx, current, err)
-			}
-			if _, err = o.store.Transition(ctx, runID, current.StateVersion, run.Succeeded, "orchestrator"); err != nil {
-				return o.fail(ctx, current, err)
-			}
-			_, _ = o.store.AppendEvent(ctx, runID, "run.succeeded", "system", "orchestrator", map[string]any{
-				"run_id": runID,
-			})
-			return nil
-		default:
-			err = fmt.Errorf("no handler for state %s", current.State)
+		cancelStep()
+		if stop, ret := o.classify(ctx, current, err); stop {
+			return ret
 		}
 		if err != nil {
-			if errors.Is(err, ErrInterrupt) {
-				return err
-			}
 			return o.fail(ctx, current, err)
 		}
 	}
@@ -165,10 +130,144 @@ func (o *Orchestrator) Run(ctx context.Context, runID string) error {
 	return o.fail(ctx, current, fmt.Errorf("orchestrator loop exceeded"))
 }
 
+func (o *Orchestrator) dispatch(ctx context.Context, current store.Run) error {
+	switch current.State {
+	case run.AwaitingApproval, run.Paused, run.PausedBudget:
+		return ErrHalt
+	case run.Created:
+		_, err := o.store.Transition(ctx, current.ID, current.StateVersion, run.Contextualising, "orchestrator")
+		return err
+	case run.Contextualising:
+		return o.seedContext(ctx, current)
+	case run.Planning, run.Observing:
+		return o.modelTurn(ctx, current)
+	case run.Verifying:
+		return o.verify(ctx, current)
+	case run.Executing:
+		_, openErr := o.store.OpenCommand(ctx, current.ID)
+		if errors.Is(openErr, store.ErrNotFound) {
+			_, err := o.store.Transition(ctx, current.ID, current.StateVersion, run.Observing, "orchestrator")
+			return err
+		}
+		return openErr
+	case run.Committing:
+		// Destroy the sandbox before the terminal state is visible. Cleanup
+		// uses its own deadline so a client disconnect cannot interrupt it.
+		if err := o.closeBounded(current.ID); err != nil {
+			return o.fail(ctx, current, err)
+		}
+		if _, err := o.store.Transition(ctx, current.ID, current.StateVersion, run.Succeeded, "orchestrator"); err != nil {
+			return o.fail(ctx, current, err)
+		}
+		_, _ = o.store.AppendEvent(ctx, current.ID, "run.succeeded", "system", "orchestrator", map[string]any{
+			"run_id": current.ID,
+		})
+		return nil
+	default:
+		return fmt.Errorf("no handler for state %s", current.State)
+	}
+}
+
+func stepContext(parent context.Context, current store.Run) (context.Context, context.CancelFunc) {
+	if current.Deadline.IsZero() || !time.Now().Before(current.Deadline) {
+		return parent, func() {}
+	}
+	return context.WithDeadline(parent, current.Deadline)
+}
+
+func (o *Orchestrator) onStop(ctx context.Context, runID string, err error) error {
+	if errors.Is(context.Cause(ctx), ErrPaused) || errors.Is(err, ErrPaused) {
+		_ = o.closeBounded(runID)
+		return nil
+	}
+	if errors.Is(context.Cause(ctx), ErrLeaseLost) || errors.Is(err, ErrLeaseLost) {
+		return ErrLeaseLost
+	}
+	return err
+}
+
+func (o *Orchestrator) classify(parent context.Context, current store.Run, err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, ErrHalt) {
+		return true, nil
+	}
+	if errors.Is(err, ErrInterrupt) || errors.Is(err, ErrLeaseLost) {
+		return true, err
+	}
+	if errors.Is(err, ErrPaused) || errors.Is(context.Cause(parent), ErrPaused) {
+		_ = o.closeBounded(current.ID)
+		return true, nil
+	}
+	if errors.Is(context.Cause(parent), ErrLeaseLost) {
+		return true, ErrLeaseLost
+	}
+	if parent.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, parent.Err())) {
+		return true, parent.Err()
+	}
+	if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil {
+		return true, o.deadlineStop(parent, current)
+	}
+	if errors.Is(err, store.ErrConflict) {
+		fresh, getErr := o.store.GetRun(context.Background(), current.ID)
+		if getErr == nil && (run.Quiescent(fresh.State) || run.IsTerminal(fresh.State)) {
+			_ = o.closeBounded(current.ID)
+			return true, nil
+		}
+	}
+	return false, err
+}
+
+func (o *Orchestrator) deadlineStop(ctx context.Context, current store.Run) error {
+	_ = o.closeBounded(current.ID)
+	fresh, err := o.store.GetRun(ctx, current.ID)
+	if err != nil {
+		return nil
+	}
+	if fresh.State == run.PausedBudget || fresh.State == run.Paused || run.IsTerminal(fresh.State) || run.Quiescent(fresh.State) {
+		return nil
+	}
+	if !run.Can(fresh.State, run.PausedBudget) {
+		return nil
+	}
+	if _, err := o.store.Transition(ctx, current.ID, fresh.StateVersion, run.PausedBudget, "deadline"); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func contextStop(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(context.Cause(ctx), ErrPaused):
+		return ErrPaused
+	case errors.Is(context.Cause(ctx), ErrLeaseLost):
+		return ErrLeaseLost
+	default:
+		return ctx.Err()
+	}
+}
+
 func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 	if current.MaxSteps >= 0 && current.StepCount >= current.MaxSteps {
-		_, err := o.store.Transition(ctx, current.ID, current.StateVersion, run.PausedBudget, "budget")
+		return o.pauseForBudget(ctx, current, "step budget exhausted", 0)
+	}
+	turns, err := o.requestTurns(ctx, current)
+	if err != nil {
 		return err
+	}
+	// Reserve is a pre-check, not a ledger hold. A provider that reports no
+	// usage, or prices that are both zero, cannot enforce a dollar cap.
+	reserve := o.reserveMicros(turns)
+	limit := usage.CentsToMicros(int64(current.BudgetCents))
+	if reserve > 0 && current.SpentMicros+reserve > limit {
+		return o.pauseForBudget(ctx, current, "reserved model cost exceeds the budget", reserve)
 	}
 	provider, err := o.modelFor(current)
 	if err != nil {
@@ -182,10 +281,6 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 	if err != nil {
 		return err
 	}
-	turns, err := o.requestTurns(ctx, current)
-	if err != nil {
-		return err
-	}
 	resp, err := provider.Complete(ctx, model.Request{
 		Goal:           current.Goal,
 		System:         model.SystemPrompt,
@@ -195,6 +290,7 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 		CompletedCalls: completed,
 	})
 	if err != nil {
+		o.noteAttempts(ctx, current, err)
 		return err
 	}
 	cost := usage.CostMicros(int64(resp.InputTokens), o.prices.InputPerMillion) +
@@ -208,8 +304,9 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 		OutputTokens: resp.OutputTokens,
 		CostMicros:   cost,
 		Model:        current.Provider,
+		Attempts:     resp.Attempts,
 	}
-	if current.SpentMicros+cost > usage.CentsToMicros(int64(current.BudgetCents)) {
+	if current.SpentMicros+cost > limit {
 		intent.Kind = "budget"
 	} else if resp.Finish {
 		intent.Kind = "finish"
@@ -246,11 +343,63 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 			intent.ToolCallID = "call_" + intent.CommandID
 		}
 	}
-	_, err = o.store.CommitModelIntent(ctx, current.ID, current.StateVersion, intent)
-	return err
+	if _, err = o.store.CommitModelIntent(ctx, current.ID, current.StateVersion, intent); err != nil {
+		return err
+	}
+	if intent.Kind == "budget" {
+		_ = o.closeBounded(current.ID)
+	}
+	return nil
+}
+
+func (o *Orchestrator) reserveMicros(turns []model.Turn) int64 {
+	if o.prices.InputPerMillion <= 0 && o.prices.OutputPerMillion <= 0 {
+		return 0
+	}
+	tokens := 0
+	for _, turn := range turns {
+		tokens += model.EstimateTokens(turn.Content)
+		tokens += model.EstimateTokens(turn.Arguments)
+		tokens += model.EstimateTokens(turn.ToolName)
+	}
+	return usage.CostMicros(int64(tokens), o.prices.InputPerMillion) +
+		usage.CostMicros(reservedOutputTokens, o.prices.OutputPerMillion)
+}
+
+func (o *Orchestrator) pauseForBudget(ctx context.Context, current store.Run, reason string, reserved int64) error {
+	_ = o.closeBounded(current.ID)
+	if _, err := o.store.Transition(ctx, current.ID, current.StateVersion, run.PausedBudget, "budget"); err != nil {
+		return err
+	}
+	_, _ = o.store.AppendEvent(ctx, current.ID, "budget.paused", "system", "budget", map[string]any{
+		"spent_micros":    current.SpentMicros,
+		"budget_cents":    current.BudgetCents,
+		"reserved_micros": reserved,
+		"reason":          reason,
+	})
+	return nil
+}
+
+func (o *Orchestrator) noteAttempts(ctx context.Context, current store.Run, err error) {
+	var status *model.StatusError
+	if !errors.As(err, &status) || status.Attempts <= 1 || ctx.Err() != nil {
+		return
+	}
+	_ = o.store.AddUsage(ctx, current.ID, "model.http_attempts", int64(status.Attempts), 0, status.Model, profileLabel(current.ProfileJSON))
+}
+
+func profileLabel(raw json.RawMessage) string {
+	prof, err := profile.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return prof.Name
 }
 
 func (o *Orchestrator) executeOpen(ctx context.Context, current store.Run) error {
+	if stop := contextStop(ctx); stop != nil {
+		return stop
+	}
 	cmd, err := o.store.OpenCommand(ctx, current.ID)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
@@ -269,6 +418,12 @@ func (o *Orchestrator) executeOpen(ctx context.Context, current store.Run) error
 		if herr := o.hooks.BeforeResult(cmd.CommandID, cmd.Tool); herr != nil {
 			return herr
 		}
+	}
+	// A pause or a lost lease leaves the command pending. apply_patch is
+	// idempotent and write_file/delete_file are hash-preconditioned, so resume
+	// reconciles instead of assuming the side effect did not happen.
+	if stop := contextStop(ctx); stop != nil {
+		return stop
 	}
 	if err != nil {
 		_ = o.store.FinishCommand(ctx, cmd.CommandID, "failed", map[string]any{
@@ -358,6 +513,9 @@ func (o *Orchestrator) verify(ctx context.Context, current store.Run) error {
 	}
 	output, code, err := ws.Test(ctx)
 	if err != nil {
+		if stop := contextStop(ctx); stop != nil {
+			return stop
+		}
 		return o.finishUnverified(ctx, current, "verification_unavailable", err.Error())
 	}
 	diff, diffCode, diffErr := ws.Diff(ctx)
@@ -542,8 +700,8 @@ func (o *Orchestrator) fail(ctx context.Context, current store.Run, cause error)
 	if current.ID == "" {
 		return cause
 	}
-	_ = o.close(ctx, current.ID)
-	_ = o.store.SetResult(ctx, current.ID, map[string]any{"error": cause.Error()}, cause.Error())
+	_ = o.closeBounded(current.ID)
+	_ = o.store.SetResult(ctx, current.ID, map[string]any{"error": cause.Error(), "category": failureCategory(cause)}, cause.Error())
 	fresh, err := o.store.GetRun(ctx, current.ID)
 	if err != nil {
 		return cause
@@ -551,10 +709,30 @@ func (o *Orchestrator) fail(ctx context.Context, current store.Run, cause error)
 	if run.Can(fresh.State, run.FailedTerminal) {
 		_, _ = o.store.Transition(ctx, current.ID, fresh.StateVersion, run.FailedTerminal, "orchestrator")
 		_, _ = o.store.AppendEvent(ctx, current.ID, "run.failed", "system", "orchestrator", map[string]any{
-			"reason": cause.Error(),
+			"reason": cause.Error(), "category": failureCategory(cause),
 		})
 	}
 	return nil
+}
+
+func failureCategory(cause error) string {
+	msg := strings.ToLower(cause.Error())
+	switch {
+	case strings.Contains(msg, "lease"):
+		return "lease"
+	case strings.Contains(msg, "docker") || strings.Contains(msg, "sandbox"):
+		return "sandbox"
+	case strings.Contains(msg, "workspace") || strings.Contains(msg, "snapshot"):
+		return "workspace"
+	default:
+		return "supervisor"
+	}
+}
+
+func (o *Orchestrator) closeBounded(runID string) error {
+	stop, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return o.close(stop, runID)
 }
 
 func (o *Orchestrator) close(ctx context.Context, runID string) error {
@@ -657,7 +835,7 @@ func (o *Orchestrator) requestTurns(ctx context.Context, current store.Run) ([]m
 }
 
 func (o *Orchestrator) finishUnverified(ctx context.Context, current store.Run, outcome, reason string) error {
-	if err := o.close(ctx, current.ID); err != nil {
+	if err := o.closeBounded(current.ID); err != nil {
 		return err
 	}
 	fresh, err := o.store.GetRun(ctx, current.ID)
@@ -696,7 +874,7 @@ func (o *Orchestrator) finishVerified(ctx context.Context, current store.Run, ou
 		return err
 	}
 	if !pass {
-		if err := o.close(ctx, current.ID); err != nil {
+		if err := o.closeBounded(current.ID); err != nil {
 			return err
 		}
 	}

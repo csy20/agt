@@ -18,6 +18,7 @@ import (
 	"github.com/csy20/agt/internal/model"
 	"github.com/csy20/agt/internal/orch"
 	"github.com/csy20/agt/internal/profile"
+	runstate "github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/sandbox"
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/telemetry"
@@ -73,6 +74,23 @@ func run() int {
 		slog.Error(err.Error())
 		return 1
 	}
+	lookup := func(ctx context.Context) func(string) (runstate.State, bool, error) {
+		return func(runID string) (runstate.State, bool, error) {
+			current, err := st.GetRun(ctx, runID)
+			if errors.Is(err, store.ErrNotFound) {
+				return "", false, nil
+			}
+			if err != nil {
+				return "", false, err
+			}
+			return current.State, true, nil
+		}
+	}
+	sweepCtx, cancelSweep := context.WithTimeout(ctx, 20*time.Second)
+	if _, err := runner.Sweep(sweepCtx, lookup(sweepCtx)); err != nil {
+		slog.Warn("sandbox sweep", "err", err)
+	}
+	cancelSweep()
 	engine := orch.New(orch.Options{
 		Store:   st,
 		DataDir: cfg.DataDir,
@@ -111,9 +129,13 @@ func run() int {
 	})
 	worker := &orch.Worker{Store: st, Run: engine.Run}
 	go worker.Loop(ctx)
+	srv := api.New(st, cfg, token)
+	srv.Cleanup = func(c context.Context) (int, error) {
+		return runner.Sweep(c, lookup(c))
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           api.New(st, cfg, token).Handler(),
+		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {

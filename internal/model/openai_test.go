@@ -106,7 +106,7 @@ func TestOpenAIRetriesRateLimitOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 || !resp.Finish || resp.ModelName != "configured-model" {
+	if calls != 2 || !resp.Finish || resp.ModelName != "configured-model" || resp.Attempts != 2 {
 		t.Fatalf("calls %d resp %+v", calls, resp)
 	}
 }

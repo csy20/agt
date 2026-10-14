@@ -116,7 +116,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.applyMigration(ctx, 2, "migrations/002_profile.sql"); err != nil {
 		return err
 	}
-	return s.applyMigration(ctx, 3, "migrations/003_transcript.sql")
+	if err := s.applyMigration(ctx, 3, "migrations/003_transcript.sql"); err != nil {
+		return err
+	}
+	return s.applyMigration(ctx, 4, "migrations/004_lease.sql")
 }
 
 func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
@@ -129,6 +132,27 @@ func (s *Store) applyMigration(ctx context.Context, version int, name string) er
 		return err
 	}
 	return s.withTx(ctx, func(tx pgx.Tx) error {
+		// 8675310 is only the migration lock. Tests hold session lock 8675309
+		// on another connection for the whole test; sharing that key deadlocks.
+		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '30s'`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(8675310)`); err != nil {
+			return err
+		}
+		var reg *string
+		if err := tx.QueryRow(ctx, `SELECT to_regclass('public.schema_migrations')`).Scan(&reg); err != nil {
+			return err
+		}
+		if reg != nil {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=$1`, version).Scan(&n); err != nil {
+				return err
+			}
+			if n > 0 {
+				return nil
+			}
+		}
 		for _, stmt := range splitSQL(string(sqlBytes)) {
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("migration %d: %w", version, err)
@@ -382,6 +406,11 @@ func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func isUnique(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 func lockRun(ctx context.Context, tx pgx.Tx, runID string) (Run, error) {
