@@ -20,14 +20,20 @@ import (
 )
 
 func TestSandboxRunsTestsAndStaysClosed(t *testing.T) {
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker absent")
-	}
 	image := os.Getenv("AGT_IMAGE_PYTHON")
 	if image == "" {
 		image = os.Getenv("AGT_SANDBOX_IMAGE")
 	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		if testutil.MissingPrereq(image != "") {
+			t.Fatalf("docker absent: %v", err)
+		}
+		t.Skip("docker absent")
+	}
 	if image == "" {
+		if testutil.MissingPrereq(false) {
+			t.Fatal("AGT_INTEGRATION=1 requires AGT_IMAGE_PYTHON or AGT_SANDBOX_IMAGE")
+		}
 		t.Skip("AGT_SANDBOX_IMAGE unset")
 	}
 	if err := exec.Command("docker", "image", "inspect", image).Run(); err != nil {

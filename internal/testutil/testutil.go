@@ -43,12 +43,14 @@ func Open(t *testing.T) *store.Store {
 	lockConn, err := pgx.Connect(dial, url)
 	cancel()
 	if err != nil {
-		if os.Getenv("AGT_DATABASE_URL") != "" {
+		if MissingPrereq(os.Getenv("AGT_DATABASE_URL") != "") {
 			t.Fatalf("postgres: %v", err)
 		}
 		t.Skipf("postgres unreachable: %v", err)
 	}
-	if _, err := lockConn.Exec(context.Background(), `SET lock_timeout = '90s'`); err != nil {
+	// One scripted repair batch holds this lock for several minutes. Other
+	// packages wait instead of failing the integration job.
+	if _, err := lockConn.Exec(context.Background(), `SET lock_timeout = '15min'`); err != nil {
 		lockConn.Close(context.Background())
 		t.Fatalf("lock timeout: %v", err)
 	}
@@ -254,6 +256,9 @@ func TestImages(t *testing.T) profile.Images {
 	goImage := os.Getenv("AGT_IMAGE_GO")
 	node := os.Getenv("AGT_IMAGE_NODE")
 	if python == "" && goImage == "" && node == "" {
+		if os.Getenv("AGT_INTEGRATION") == "1" {
+			t.Fatal("AGT_INTEGRATION=1 requires AGT_IMAGE_PYTHON, AGT_IMAGE_GO, and AGT_IMAGE_NODE")
+		}
 		return profile.Images{}
 	}
 	if python == "" || goImage == "" || node == "" {
@@ -268,6 +273,18 @@ func TestImages(t *testing.T) profile.Images {
 		}
 	}
 	return profile.Images{Python: python, Go: goImage, Node: node}
+}
+
+// missingPrereq reports whether a missing dependency must fail the test.
+// An integration run, or a dependency the caller explicitly configured, fails
+// closed. An ordinary unit run may skip. A skip is not evidence.
+func missingPrereq(integration, explicit bool) bool {
+	return integration || explicit
+}
+
+// MissingPrereq reads AGT_INTEGRATION. The value "1" is an integration run.
+func MissingPrereq(explicit bool) bool {
+	return missingPrereq(os.Getenv("AGT_INTEGRATION") == "1", explicit)
 }
 
 func providerName(e *Engine) string {

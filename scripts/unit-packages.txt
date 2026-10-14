@@ -1,0 +1,23 @@
+# Packages that do not open Postgres and do not require Docker.
+# internal/sandbox includes TestSandboxRunsTestsAndStaysClosed. make unit
+# clears the image variables, so that test skips. The skip is not container
+# support. make test sets AGT_INTEGRATION=1 and fails instead of skipping.
+./cmd/agt
+./cmd/agtd
+./internal/auth
+./internal/cli
+./internal/config
+./internal/diag
+./internal/model
+./internal/patch
+./internal/policy
+./internal/profile
+./internal/redact
+./internal/run
+./internal/sandbox
+./internal/telemetry
+./internal/testutil
+./internal/tools
+./internal/usage
+./internal/version
+./internal/workspace

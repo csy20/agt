@@ -12,7 +12,10 @@ ifeq ($(OS),Windows_NT)
 EXE := .exe
 endif
 
-.PHONY: build up image test demo clean
+.PHONY: build up image test unit package demo clean
+
+# Dependency-free packages. See scripts/unit-packages.txt.
+UNIT_PKGS := $(shell sed '/^[[:space:]]*\#/d;/^[[:space:]]*$$/d' scripts/unit-packages.txt)
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -27,8 +30,21 @@ image:
 	docker build -t $(AGT_IMAGE_GO) -f deploy/go.Dockerfile deploy
 	docker build -t $(AGT_IMAGE_NODE) -f deploy/node.Dockerfile deploy
 
+# test is the integration job. It starts Postgres, builds the three images,
+# and fails when Docker, an image, or Postgres is missing. AGT_INTEGRATION=1
+# turns the old skips into failures. The timeout covers the scripted repair batch.
 test: up image
-	go test ./...
+	AGT_INTEGRATION=1 go test -timeout 20m ./...
+
+# unit does not start Postgres or Docker. It clears the integration variables
+# that this Makefile exports. The sandbox package then skips
+# TestSandboxRunsTestsAndStaysClosed. That skip is not container support.
+unit:
+	env -u AGT_INTEGRATION -u AGT_DATABASE_URL -u AGT_IMAGE_PYTHON -u AGT_IMAGE_GO -u AGT_IMAGE_NODE -u AGT_SANDBOX_IMAGE \
+		go test $(UNIT_PKGS)
+
+package:
+	sh scripts/package.sh
 
 demo: build up image
 	mkdir -p /tmp/agt-demo

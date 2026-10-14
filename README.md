@@ -6,6 +6,10 @@ A run is the durable object in Postgres. The model proposes one tool call. Polic
 
 The fake provider script lives in `eval/scripts/`, outside the fixture repository, so a search of the repo cannot see the answer. It is a labelled demo. `agt` does not load it unless `--script` is passed, and it is not a live model. `--provider` defaults to `AGT_PROVIDER`. There is no silent provider.
 
+`TestScriptedRepairBatch` runs 20 generated fake-provider tasks across Python, Go, and JavaScript. A hidden check is written after the run, outside the worktree. Two tasks edit an in-repo test after approval and fail that hidden check. Two tasks leave the bug and fail verification. The solve rate of that batch is the script's outcome. It is not a hosted-model score.
+
+`make test` starts Postgres, builds the three sandbox images, sets `AGT_INTEGRATION=1`, and fails if Docker, an image, or Postgres is missing. `make unit` does not start those services. On Windows, `scripts/test.ps1` is the development entry. It was not executed on the Linux host that added it. `docs/beta.md` covers setup, upgrade, and uninstall. `scripts/package.sh` writes unsigned archives under `dist/` and does not publish them. The repository has no `LICENSE` file.
+
 ## Demo
 
 ```sh
@@ -71,6 +75,9 @@ On Linux the data directory stays `~/.local/share/agt` when `AGT_DATA_DIR` is un
 | `eval/fixtures/gocounter` | Buggy Go sample |
 | `eval/fixtures/jsquote` | Buggy JavaScript sample |
 | `eval/scripts/` | Scripted model steps, kept outside the fixtures |
+| `docs/beta.md` | Fresh-machine setup, upgrade, and uninstall |
+| `scripts/test.ps1` | PowerShell unit and integration entry. Not executed on the packaging host |
+| `scripts/package.sh` | Local unsigned `agt` and `agtd` archives under `dist/` |
 
 `agtd` reads `AGT_DATABASE_URL`, `AGT_SANDBOX_IMAGE`, `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, `AGT_IMAGE_NODE`, `AGT_LISTEN`, `AGT_DATA_DIR`, `AGT_CONFIG_DIR`, `AGT_CACHE_DIR`, and `AGT_PROVIDER`. Set `AGT_TOKEN` to choose the local bearer token; otherwise `agtd` creates `$AGT_DATA_DIR/auth.token`. An OpenAI-compatible provider is selected with `--provider openai`, `AGT_MODEL_BASE_URL`, and `AGT_MODEL_NAME`. `AGT_MODEL_API_KEY` is required unless the base URL is loopback (`localhost`, `::1`, or a loopback address). The default base URL is `https://api.openai.com/v1`. Set `AGT_OTLP_ENDPOINT` to export traces; export failure does not fail the run. `agt doctor` is the setup check. It does not start the daemon.
 

@@ -6,7 +6,7 @@ Build and test from the repository root:
 make test
 ```
 
-`make test` starts Postgres, builds the Python, Go, and JavaScript sandbox images, and runs `go test ./...`. A `go test` without `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, and `AGT_IMAGE_NODE` can use the host runner inside tests. That is not container support. Production `agtd` has no host fallback.
+`make test` starts Postgres, builds the Python, Go, and JavaScript sandbox images, sets `AGT_INTEGRATION=1`, and runs `go test ./...`. That job must fail when Docker, an image, or Postgres is missing. Do not turn that failure into a skip. `make unit` clears those variables and runs `scripts/unit-packages.txt`. A skip in `make unit` is not container support. Production `agtd` has no host fallback. `scripts/test.ps1` is the PowerShell entry. The Makefile demo is not that path.
 
 A model can request an action. Deterministic Go decides authority. There is no shell tool. Model names and token prices come from environment variables (`AGT_MODEL_NAME`, `AGT_INPUT_USD_PER_M`, `AGT_OUTPUT_USD_PER_M`), not from source constants.
 
@@ -29,3 +29,5 @@ A job lease lasts 30 seconds and is renewed about every 10 seconds. Claim increm
 Check the estimated request cost before calling the model. Reconcile the reported usage afterward. Do not insert the estimate as a usage row. Zero prices, or a provider that reports no usage, are not a dollar cap. Record the configured model name and profile name on usage rows. Count HTTP attempts when the provider reports more than one, and count every `run_test`, including the verifier. Startup and `agt run cleanup` may remove containers for terminal, paused, cancelled, or missing runs. Do not remove a container for a live state such as `EXECUTING` or `VERIFYING`. Do not delete the data directory. A verification return to observing still leaves the sandbox open.
 
 `agt doctor` names the next setup command and does not start `agtd` or call a model. `agt run list` reads the durable runs. Attach resumes from the last rendered event id and does not print that event again. A heartbeat comment is not an event. Ctrl+C during attach detaches; `agt run cancel` is the cancel. A daemon started by the client stays up after the client exits. On Linux, an unset `AGT_DATA_DIR` stays `~/.local/share/agt` even when `XDG_DATA_HOME` is set. `--model` must match the daemon's `AGT_MODEL_NAME` and is not sent as a hosted-model call.
+
+The scripted repair batch uses the fake provider. Keep its hidden check outside the worktree. Do not report its solve rate as a hosted-model result. `passed_after_test_edit` is not a hidden-check pass. Local release archives stay under gitignored `dist/`. Do not invent a license file. Do not publish the archives. Cross-compiled archives are not native execution.
