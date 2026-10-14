@@ -280,6 +280,30 @@ func (s *Store) GetRun(ctx context.Context, runID string) (Run, error) {
 	return scanRun(s.pool.QueryRow(ctx, `SELECT `+runColumns+` FROM runs WHERE id=$1`, runID))
 }
 
+// ListRuns returns the newest runs, up to limit. limit is clamped to 1..100.
+func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+runColumns+` FROM runs ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Run{}
+	for rows.Next() {
+		current, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, current)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) getByIdempotency(ctx context.Context, key string) (Run, error) {
 	return scanRun(s.pool.QueryRow(ctx, `SELECT `+runColumns+` FROM runs WHERE idempotency_key=$1`, key))
 }

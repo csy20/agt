@@ -43,7 +43,9 @@ func New(st *store.Store, cfg config.Config, token string) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("GET /v1/identity", s.identity)
 	mux.HandleFunc("POST /v1/runs", s.createRun)
+	mux.HandleFunc("GET /v1/runs", s.listRuns)
 	mux.HandleFunc("GET /v1/runs/{id}", s.getRun)
 	mux.HandleFunc("GET /v1/runs/{id}/events", s.events)
 	mux.HandleFunc("GET /v1/runs/{id}/commands", s.listCommands)
@@ -61,12 +63,48 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	s.stamp(w)
+	if s.Store == nil {
+		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if err := s.Store.Ping(r.Context()); err != nil {
 		http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+	limit := 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 100 {
+			writeError(w, http.StatusBadRequest, "limit must be from 1 to 100")
+			return
+		}
+		limit = n
+	}
+	if s.Store == nil {
+		writeError(w, http.StatusServiceUnavailable, "database unavailable")
+		return
+	}
+	runs, err := s.Store.ListRuns(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	views := []runViewBody{}
+	for _, current := range runs {
+		view, err := s.present(r.Context(), current)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		views = append(views, view)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": views})
 }
 
 type createRequest struct {
@@ -286,8 +324,10 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, runID string, af
 		writeError(w, http.StatusInternalServerError, "streaming is not supported")
 		return
 	}
+	s.stamp(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	idleTicks := 0
 	for {
 		if r.Context().Err() != nil {
 			return
@@ -296,11 +336,21 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, runID string, af
 		if err != nil {
 			return
 		}
-		for _, ev := range evs {
-			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, ev.Payload)
-			after = ev.Seq
+		if len(evs) == 0 {
+			idleTicks++
+			if idleTicks >= heartbeatEvery {
+				idleTicks = 0
+				fmt.Fprintf(w, ": heartbeat\n\n")
+				flusher.Flush()
+			}
+		} else {
+			idleTicks = 0
+			for _, ev := range evs {
+				fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.Seq, ev.Type, ev.Payload)
+				after = ev.Seq
+			}
+			flusher.Flush()
 		}
-		flusher.Flush()
 		current, err := s.Store.GetRun(r.Context(), runID)
 		if err != nil {
 			return
@@ -312,7 +362,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, runID string, af
 			}
 			continue
 		}
-		timer := time.NewTimer(150 * time.Millisecond)
+		timer := time.NewTimer(streamPoll)
 		select {
 		case <-r.Context().Done():
 			timer.Stop()
@@ -321,6 +371,11 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, runID string, af
 		}
 	}
 }
+
+const (
+	streamPoll     = 150 * time.Millisecond
+	heartbeatEvery = 100 // about 15s at streamPoll, so a client can notice a dead connection
+)
 
 func stopStream(state run.State) bool {
 	return run.IsTerminal(state) || state == run.Paused || state == run.PausedBudget || state == run.AwaitingApproval

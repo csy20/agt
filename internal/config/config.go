@@ -2,7 +2,6 @@ package config
 
 import (
 	"os"
-	"path/filepath"
 	"strconv"
 
 	"github.com/csy20/agt/internal/profile"
@@ -46,7 +45,7 @@ func Load() Config {
 		ImagePython:      python,
 		ImageGo:          env("AGT_IMAGE_GO", "agt-sandbox:go"),
 		ImageNode:        env("AGT_IMAGE_NODE", "agt-sandbox:node"),
-		DataDir:          env("AGT_DATA_DIR", defaultDataDir()),
+		DataDir:          CurrentPlaces().Data,
 		Provider:         env("AGT_PROVIDER", "fake"),
 		ModelBaseURL:     env("AGT_MODEL_BASE_URL", "https://api.openai.com/v1"),
 		ModelAPIKey:      os.Getenv("AGT_MODEL_API_KEY"),
@@ -95,12 +94,4 @@ func dollarsPerMillion(key string, fallback float64) int64 {
 		}
 	}
 	return int64(dollars * 1_000_000)
-}
-
-func defaultDataDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(os.TempDir(), "agt")
-	}
-	return filepath.Join(home, ".local", "share", "agt")
 }

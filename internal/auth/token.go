@@ -63,6 +63,27 @@ func LoadOrCreate(dataDir string) (string, error) {
 	return token, nil
 }
 
+// FilePrivate reports whether auth.token exists, is not a symlink, and is
+// private to the owner. It does not create a token and ignores AGT_TOKEN.
+func FilePrivate(dataDir string) error {
+	path := filepath.Join(dataDir, fileName)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to read a symlinked auth.token")
+	}
+	ok, err := filePrivate(path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("auth.token is readable by someone other than the owner")
+	}
+	return nil
+}
+
 // Read returns AGT_TOKEN or the token file. It does not create a token.
 func Read(dataDir string) (string, error) {
 	if env := strings.TrimSpace(os.Getenv("AGT_TOKEN")); env != "" {

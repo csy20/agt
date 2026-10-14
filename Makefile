@@ -35,7 +35,7 @@ demo: build up image
 	chmod 700 /tmp/agt-demo
 	AGT_DATA_DIR=/tmp/agt-demo ./$(BIN_DIR)/agtd$(EXE) >/tmp/agtd.log 2>&1 & echo $$! >/tmp/agtd.pid
 	i=0; \
-	until curl -sf http://127.0.0.1:8787/healthz >/dev/null || [ $$i -ge 40 ]; do \
+	until curl -sf -D - http://127.0.0.1:8787/healthz | grep -q '^X-Agt-Product: agt' || [ $$i -ge 40 ]; do \
 		i=$$((i+1)); sleep 0.25; \
 	done
 	AGT_DATA_DIR=/tmp/agt-demo ./$(BIN_DIR)/agt$(EXE) fix --repo eval/fixtures/payrepo --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script eval/scripts/fix_retry.json "make the retry test pass"; \

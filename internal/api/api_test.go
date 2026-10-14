@@ -20,6 +20,7 @@ import (
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/testutil"
+	"github.com/csy20/agt/internal/version"
 )
 
 const testToken = "test-token-value1"
@@ -33,9 +34,13 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	healthBody, _ := io.ReadAll(health.Body)
 	health.Body.Close()
-	if health.StatusCode != http.StatusOK {
-		t.Fatalf("health %d", health.StatusCode)
+	if health.StatusCode != http.StatusOK || string(healthBody) != "ok\n" {
+		t.Fatalf("health %d %q", health.StatusCode, healthBody)
+	}
+	if health.Header.Get(version.ProductHeader) != version.Name || health.Header.Get(version.VersionHeader) != version.Product {
+		t.Fatalf("health identity %v", health.Header)
 	}
 
 	body := map[string]any{
@@ -50,6 +55,24 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	first := postRun(t, ts.URL, body, "idem-1")
 	if first.status != http.StatusAccepted {
 		t.Fatalf("create %d %s", first.status, first.body)
+	}
+	listed := getJSON(t, ts.URL+"/v1/runs")
+	listedRaw, _ := json.Marshal(listed)
+	if !strings.Contains(string(listedRaw), first.runID) {
+		t.Fatalf("list %s", listedRaw)
+	}
+	identReq, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/identity", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identResp, err := http.DefaultClient.Do(identReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identBody, _ := io.ReadAll(identResp.Body)
+	identResp.Body.Close()
+	if identResp.StatusCode != http.StatusOK || !strings.Contains(string(identBody), version.Product) {
+		t.Fatalf("identity %d %s", identResp.StatusCode, identBody)
 	}
 	second := postRun(t, ts.URL, body, "idem-1")
 	if second.status != http.StatusOK || second.runID != first.runID {

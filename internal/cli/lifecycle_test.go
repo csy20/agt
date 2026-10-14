@@ -13,7 +13,7 @@ func TestRunLifecyclePostsTheRunAndLeavesAttachAsDetach(t *testing.T) {
 	var posts []string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
-			w.WriteHeader(http.StatusOK)
+			writeTestHealth(w)
 			return
 		}
 		if r.Header.Get("Authorization") != "Bearer test-token-value1" {

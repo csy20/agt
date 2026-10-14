@@ -12,7 +12,15 @@ import (
 	"github.com/csy20/agt/internal/tools"
 )
 
-const Product = "0.1.0"
+const (
+	// Name is the product token a daemon must present. A bare HTTP 200 is not enough.
+	Name = "agt"
+	// Product is the release version. The client rejects a daemon on a different value.
+	Product = "0.1.0"
+	// ProductHeader and VersionHeader are set on /healthz and are not a secret.
+	ProductHeader = "X-Agt-Product"
+	VersionHeader = "X-Agt-Version"
+)
 
 // Compute stamps the contracts and sandbox images that change agent behaviour.
 func Compute(images ...string) string {

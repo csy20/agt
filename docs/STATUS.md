@@ -1,6 +1,6 @@
 # AGT status
 
-Updated 14 October 2026 on branch `milestone-6-lifecycle`, based on `milestone-5-review` at `313bac6`.
+Updated 14 October 2026 on branch `milestone-7-workflow`, based on `milestone-6-lifecycle` at `fe3c8e3`.
 This file records what the code and the checks actually show. A passing fake-provider demo is not a live-model repair. A cross-compile is not native execution. A skipped integration test is not support.
 
 ## Milestone 1
@@ -15,13 +15,13 @@ Implemented on `milestone-2-authority` and still present here.
 |---|---|---|
 | `AGT_LISTEN` must be loopback, including `::1` and the literal name `localhost`. Empty host, `0.0.0.0`, and a LAN address fail before Postgres or Docker | `internal/config/listen.go`, `cmd/agtd/main.go` | `TestValidateListenAddr`. `TestNonLoopbackListenExits` runs `agtd`'s startup function for `0.0.0.0:1`, `192.168.1.20:1`, and `:8787` and requires a non-zero exit whose log mentions `AGT_LISTEN` |
 | Per-data-dir token at `$AGT_DATA_DIR/auth.token`, mode `0600` on Unix. A group- or world-readable file is replaced. A symlink is refused. `AGT_TOKEN` overrides and is written for the client | `internal/auth` | `TestTokenFileIsPrivateAndStable`, `TestLooseTokenIsRotated`, `TestSymlinkedTokenIsRefused`, `TestEnvironmentTokenIsStoredForTheClient` |
-| Every route except `GET /healthz` requires `Authorization: Bearer`. An empty server token fails closed. The 401 body does not echo the token | `internal/api/guard.go`, `internal/cli/cli.go` | `TestMissingTokenCannotCreateOrApprove` posts to create and approve without a token. `TestApproveAcceptsFlagsAfterIDs` checks the bearer header. `make demo` shares `AGT_DATA_DIR` between `agtd` and `agt` |
+| Every route except `GET /healthz` and `GET /v1/identity` requires `Authorization: Bearer`. An empty server token fails closed. The 401 body does not echo the token. Identity was added in Milestone 7 and returns the product, version, provider, and model name. It does not return the API key or the bearer token | `internal/api/guard.go`, `internal/cli/cli.go` | `TestMissingTokenCannotCreateOrApprove` posts to create and approve without a token. `TestApproveAcceptsFlagsAfterIDs` checks the bearer header. `TestIdentityIsOpenAndOmitsSecrets` |
 | Browser `Origin` and a non-loopback `Host` are rejected on every route, including health | `internal/api/guard.go` | `TestBrowserOriginAndRemoteHostAreRejected` |
 | Secret filenames and credential directories are not copied, searched, read, written, deleted, or patched. `.env.example`, `.env.sample`, and `.env.template` stay available. `..`, absolute paths, drive and UNC paths, and `:` are rejected. Spaces and Unicode inside the tree are allowed | `internal/tools/secret.go`, `internal/tools/path.go`, `internal/policy/policy.go`, `internal/workspace/dir.go` | `TestSafeRelRejectsEscapes`, `TestSafeRelAllowsSpacesAndUnicode`, `TestReadAllowsContainedNamesAndRefusesSecrets`, `TestSearchSkipsSecretsAndBinary`, `TestSecretPathsAreDenied`, `TestWriteAndDeleteStayInsideTheTree`, `TestMaterializeSkipsSecretFiles`, `TestSymlinkEscapeIsNotWritten` |
 | High-confidence secrets in tool output are redacted before the model sees them and before an event excerpt is stored. The command row keeps the original text | `internal/redact`, `internal/orch/orch.go`, `internal/store/commands.go` | `TestTextHidesSecretsAndKeepsCode`, `TestModelTextRedactsBeforeTheModel` |
 | The sandbox argv has one bind mount, the run workspace at `/workspace`. Home, credential directories, and the Docker socket are refused. The container does not inherit the host environment. Network, capability, and resource limits stay in place | `internal/sandbox/mount.go`, `internal/sandbox/env.go`, `internal/sandbox/docker.go` | `TestContainerRunMountsOnlyTheWorktree`, `TestMountSourceRejectsHomeCredentialsAndSocket`, `TestDockerProcessEnvDropsHostSecrets`, `TestSandboxRunsTestsAndStaysClosed` |
 
-`GET /healthz` stays unauthenticated so the client can see whether `agtd` is up. It still rejects a non-local `Host` and any `Origin`.
+`GET /healthz` and `GET /v1/identity` stay unauthenticated so the client can see whether `agtd` is up and which version it is. Both still reject a non-local `Host` and any `Origin`. The health body is still `ok\n`.
 
 Windows ACL code is in `internal/auth/perm_windows.go`. It sets a current-user DACL and replaces a token whose DACL grants anyone else. The Windows junction check is `TestJunctionEscapeIsNotRead`. Both were cross-compiled in Milestone 2. Neither was executed on Windows. This milestone did not recompile `internal/auth`. It did cross-compile `internal/tools`, which contains the junction test, and that binary was not executed.
 
@@ -79,7 +79,7 @@ Implemented on `milestone-5-review` at `313bac6` and still present here. The wor
 
 ## Milestone 6
 
-Implemented on this branch. A worker renews its job lease and can stop a run without another worker replaying a stolen job. Pause, resume, cancel, and budget resume are explicit. Leaving `agt run attach` is still not cancel. The snapshot apply is unchanged.
+Implemented on `milestone-6-lifecycle` at `fe3c8e3` and still present. A worker renews its job lease and can stop a run without another worker replaying a stolen job. Pause, resume, cancel, and budget resume are explicit. Leaving `agt run attach` is still not cancel. The snapshot apply is unchanged.
 
 | Control | Where | Check |
 |---|---|---|
@@ -92,13 +92,29 @@ Implemented on this branch. A worker renews its job lease and can stop a run wit
 
 `apply_patch` remains idempotent. `write_file` and `delete_file` remain hash-preconditioned. This milestone does not promise exactly-once execution for an arbitrary command. A hosted model was not called. An approved test-file edit followed by passing verification was still not integration-tested.
 
+## Milestone 7
+
+Implemented on this branch. `agt doctor`, `agt run list`, and daemon discovery are new. Pause, resume, cancel, diff, export, and apply are unchanged. Ctrl+C during `agt run attach` still does not cancel the run.
+
+| Control | Where | Check |
+|---|---|---|
+| `GET /healthz` sets `X-Agt-Product: agt` and `X-Agt-Version` to `0.1.0` and still writes `ok\n`. `GET /v1/identity` is unauthenticated and returns product, version, provider, model name, and listen address. It does not return `AGT_MODEL_API_KEY` or the bearer token. The client treats any other HTTP 200 as a different server. A version mismatch does not start a second daemon | `internal/api/identity.go`, `internal/api/guard.go`, `internal/cli/stream.go` | `TestIdentityIsOpenAndOmitsSecrets`, `TestHealthIdempotencyAndOpenAIGuard` (body `ok\n` and the headers), `TestDiscoverRejectsAnyHTTP200`, `TestDiscoverAcceptsThisVersionOnly` |
+| `agt doctor` checks listen, model configuration, Docker, the three images, Postgres, the data directory mode, the token mode, and daemon identity. The first failure names the next command. It does not start `agtd` and does not call a model. `--json` prints the report | `internal/cli/doctor.go` | `TestDoctorNamesTheFirstFailure`, `TestLooseTokenAndDataDirNameTheNextCommand`, `TestDockerCheckNamesInstallWhenTheBinaryIsMissing`. A live `go run ./cmd/agt doctor` on this host is recorded under Checks |
+| `GET /v1/runs` lists the newest runs, at most 100. `agt run list` prints each run and the review commands. `agt run status` prints the repository, cost, and the next command | `internal/store/store.go`, `internal/api/server.go`, `internal/cli/list.go` | `TestHealthIdempotencyAndOpenAIGuard` lists the created run. `TestRunListPrintsReviewCommands` |
+| Attach reads `id:` lines and reconnects with `after` set to the last rendered sequence. A repeated sequence is not printed. Comment heartbeats are ignored. The server writes `: heartbeat` after about 15 seconds of silence. A stream that ends while the run is still working is retried. A terminal, paused, budget-paused, or approval state ends the stream. Ctrl+C prints that the run was not cancelled | `internal/api/server.go`, `internal/cli/stream.go` | `TestReadSSEKeepsTheCursorAndSkipsHeartbeats`, `TestAttachReconnectsWithoutReplaying` |
+| `--model` compares the daemon's `AGT_MODEL_NAME` and does not add the name to the create body. `--json` is accepted on `fix`, `attach`, `status`, `list`, and `doctor`. `NO_COLOR` and a non-terminal stdout stay plain. `agt completion` prints bash, zsh, fish, and PowerShell scripts | `internal/cli/cli.go`, `internal/cli/complete.go`, `internal/cli/color.go` | `TestModelFlagRejectsADifferentDaemonModel`, `TestCompletionCoversTheShells`, `TestColorStaysOffForPipesAndNO_COLOR` |
+| Linux data stays `~/.local/share/agt` even when `XDG_DATA_HOME` is set. Config follows `XDG_CONFIG_HOME` or `~/.config/agt`. Cache follows `XDG_CACHE_HOME` or `~/.cache/agt`. Darwin uses `~/Library/Application Support/agt` and `~/Library/Caches/agt`. Windows uses `%AppData%\agt` and `%LocalAppData%\agt`. `AGT_DATA_DIR`, `AGT_CONFIG_DIR`, and `AGT_CACHE_DIR` override those. The log stays `$AGT_DATA_DIR/agtd.log`. `agtd` writes `agtd.pid` and `agtd.addr` after the port is bound and removes them on a clean shutdown. A client-started daemon is detached and locked so two clients do not both start one. A recorded address that is not loopback is ignored | `internal/config/paths.go`, `internal/cli/lock_unix.go`, `internal/cli/lock_windows.go`, `cmd/agtd/main.go` | `TestLinuxDataDirStaysBesideTheHomeShare`, `TestDarwinAndWindowsUseTheirOwnDirectories`, `TestStartLockIsExclusive`, `TestRecordedDaemonURLRejectsAPublicHost` |
+
+Progress lines include tool exit text, verification outcome, baseline exit, cost, repository, worktree, and the next `diff`, `export`, or `apply` command when the run succeeded. `apply` is still explicit. A hosted model was not called.
+
 ## Checks run on this machine
 
 Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 via `deploy/compose.yaml` on `127.0.0.1:54329`.
 
-- `go test ./...` passed. `AGT_DATABASE_URL` was unset, so the tests used the default URL `postgres://agt:agt@127.0.0.1:54329/agt?sslmode=disable` and Postgres was up. `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, and `AGT_IMAGE_NODE` were the existing tags `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`. This run did not rebuild those images. `internal/api` passed in about 23 seconds, `internal/store` in about 28 seconds, `internal/orch` in about 79 seconds, and `internal/sandbox` in about 5 seconds. The orchestrator package included the repair-loop tests, `TestLoopbackAdapterRepairsPayrepo`, `TestReviewedApplyUpdatesACopyAndRejectsAStalePatch`, `TestBudgetPauseBeforeSideEffects`, and `TestResumeDoesNotDoubleApplyPatch`. The source fixtures were unchanged.
-- `make test` and `make demo` were not re-run on this branch. The Milestone 3 demo still applies to the fake-provider path: it exited 0 with `AGT_DATA_DIR=/tmp/agt-demo`, token mode `600`, directory mode `700`, `--profile python`, and run id `run_0c3fc8d8e0165c95`. That demo is not the loopback adapter test and was not repeated here.
-- `CGO_ENABLED=0` `go test -c` for `windows/amd64`, `darwin/amd64`, `darwin/arm64`, and `linux/arm64` succeeded for `internal/api`, `internal/cli`, `internal/orch`, `internal/store`, `internal/sandbox`, `internal/model`, and `internal/run`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The 36 scratch binaries were deleted. `internal/auth`, `internal/patch`, and `internal/workspace` were not cross-compiled on this branch. The Linux amd64 binaries used by `go test` were executed.
+- `go test ./...` passed in about 101 seconds. `AGT_DATABASE_URL` was unset, so the tests used the default URL `postgres://agt:agt@127.0.0.1:54329/agt?sslmode=disable` and Postgres was up. `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, and `AGT_IMAGE_NODE` were the existing tags `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`. This run did not rebuild those images. `internal/api` passed in about 20 seconds, `internal/store` in about 31 seconds, `internal/orch` in about 97 seconds, `internal/sandbox` in about 5 seconds, and `internal/cli` in under 1 second. The orchestrator package included the repair-loop tests, `TestLoopbackAdapterRepairsPayrepo`, `TestReviewedApplyUpdatesACopyAndRejectsAStalePatch`, `TestBudgetPauseBeforeSideEffects`, and `TestResumeDoesNotDoubleApplyPatch`. The source fixtures were unchanged.
+- `go run ./cmd/agt doctor` exited 1. Listen, the fake provider, Docker, the three existing images, and Postgres passed. The Postgres URL password was redacted. The default data directory `~/.local/share/agt` did not exist, so the token file was absent and nothing was listening on `127.0.0.1:8787`. The first next command told the user that `agtd` creates that directory. Doctor did not start a daemon and did not call a model.
+- `make test` and `make demo` were not re-run on this branch. The Milestone 3 demo still applies to the fake-provider path: it exited 0 with `AGT_DATA_DIR=/tmp/agt-demo`, token mode `600`, directory mode `700`, `--profile python`, and run id `run_0c3fc8d8e0165c95`. That demo is not the loopback adapter test and was not repeated here. The Makefile demo now requires `X-Agt-Product: agt` instead of any HTTP 200. That change was not executed.
+- `CGO_ENABLED=0` `go test -c` for `windows/amd64`, `darwin/amd64`, `darwin/arm64`, and `linux/arm64` succeeded for `internal/api`, `internal/cli`, `internal/config`, `internal/auth`, and `internal/store`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The 28 scratch binaries were deleted. `internal/orch`, `internal/sandbox`, `internal/model`, `internal/run`, `internal/patch`, and `internal/workspace` were not cross-compiled on this branch. The Linux amd64 binaries used by `go test` were executed. Darwin and Windows path defaults were checked as pure functions, not by running those operating systems.
 
 `internal/testutil.Open` still skips when Postgres is unreachable and `AGT_DATABASE_URL` is unset. That skip is not evidence of database support. `make test` sets the URL and fails if Postgres is down. A `go test` that does not export the three image variables may use the host runner. Do not record that run as container support.
 
@@ -106,8 +122,8 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 
 | Area | State | Evidence |
 |---|---|---|
-| CLI fix / run / approve / version | Partial | Commands above work and send the local token. `fix` and `run create` require `--profile`. `profile detect` only suggests. `run diff`, `run export`, and `run apply` review or write the recorded repository. `run pause`, `run resume`, `run budget-resume`, `run cancel`, and `run cleanup` call the daemon. There is no run list |
-| Daemon and API | Partial | Health is open. Other routes require the local token. Listen is loopback-only. Postgres required. Create rejects a missing profile, a client-supplied image, and a repository nested with the data directory. Diff, patch, and apply are local and digest-bound. Pause, resume, budget resume, cancel, and cleanup are explicit |
+| CLI fix / run / approve / version | Partial | Commands above work and send the local token. `fix` and `run create` require `--profile`. `profile detect` only suggests. `run list`, `run diff`, `run export`, and `run apply` review or write the recorded repository. `run pause`, `run resume`, `run budget-resume`, `run cancel`, and `run cleanup` call the daemon. `doctor` and `completion` are local. `--json` is available on list, status, attach, fix, and doctor. Discovery rejects a server that is not this product and version |
+| Daemon and API | Partial | Health and identity are open and carry the product version. Other routes require the local token. Listen is loopback-only. Postgres required. Create rejects a missing profile, a client-supplied image, and a repository nested with the data directory. Diff, patch, and apply are local and digest-bound. Pause, resume, budget resume, cancel, cleanup, and run list are explicit. The event stream sends a heartbeat comment |
 | Run lifecycle | Partial | States and compare-and-swap exist. `COMMITTING` is not a Git commit. Pause, resume, budget resume, and cancel are user commands. A job fence blocks a stale worker from releasing a stolen job. Leaving `attach` is not cancel |
 | Persistence | Partial | `001_init.sql`, `002_profile.sql` (`profile_json`), `003_transcript.sql` (`model_messages`), and `004_lease.sql` (fence, usage identity, one active job). Leases last 30 seconds and are renewed about every 10 seconds |
 | Agent loop | Partial | A failing verification can return to the model while budget remains. `TestLoopbackAdapterRepairsPayrepo` repaired payrepo through a local OpenAI-compatible server. Fake-provider fixtures remain demos. No hosted-model run |
@@ -120,19 +136,19 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 | Telemetry | Partial | JSON logs and optional OTLP. Not a quality measure |
 | Windows native | Unverified | Cross-compile, including the junction test in `internal/tools`. ACL code was cross-compiled in Milestone 2 and was not executed. No Windows execution |
 | macOS | Unverified | Darwin cross-compile only. Bind-mount uid behavior is not measured |
-| Linux | Partial | `go test ./...` passed on this amd64 host with the existing sandbox tags. `make test` and `make demo` were not re-run on this branch. arm64 was cross-compiled only |
+| Linux | Partial | `go test ./...` passed on this amd64 host with the existing sandbox tags. `agt doctor` saw Docker, the three images, and Postgres, and reported that the default data directory and daemon were absent. `make test` and `make demo` were not re-run on this branch. arm64 was cross-compiled only |
 | Windows via WSL2 | Unverified | Not run |
 
 ## Not in this branch
 
-Milestones 7 and 8 from the 14 October 2026 audit are not done. In particular: an installable terminal workflow and an evaluation set of unfamiliar tasks. The loopback adapter test is a local OpenAI-compatible server. It is not evidence that a hosted model repaired a repository. The fake-provider fixtures remain labelled demos. A reviewed apply is not an automatic apply, and it is not a Git commit. Lease renewal does not make tool execution exactly-once. A cost budget is not a hard dollar cap when prices are zero or the provider reports no usage.
+Milestone 8 from the 14 October 2026 audit is not done. In particular: an evaluation set of unfamiliar tasks and packaged beta artifacts. The loopback adapter test is a local OpenAI-compatible server. It is not evidence that a hosted model repaired a repository. The fake-provider fixtures remain labelled demos. A reviewed apply is not an automatic apply, and it is not a Git commit. Lease renewal does not make tool execution exactly-once. A cost budget is not a hard dollar cap when prices are zero or the provider reports no usage. `agt doctor` on this host did not find a running daemon in the default data directory. macOS and Windows directory defaults were not executed.
 
 The roadmap is not complete.
 
 ## Handoff
 
-Stay on `milestone-6-lifecycle` or branch from it. Do not push unless asked.
+Stay on `milestone-7-workflow` or branch from it. Do not push unless asked.
 
-Milestone 7 next: a usable terminal workflow that starts from an existing shell, shows the review, and applies only when the user asks. Keep the snapshot apply explicit. Do not treat the fake-provider fixtures as a hosted-model run.
+Milestone 8 next: separate integration checks that fail when Docker or Postgres is missing, an evaluation set that is not a hosted-model run, and reviewable beta artifacts. Keep the snapshot apply explicit. Do not treat the fake-provider fixtures as a hosted-model run.
 
 The Windows ACL and junction tests still need a Windows run before those controls can be called supported. macOS and linux/arm64 were not executed.

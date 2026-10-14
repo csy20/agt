@@ -20,8 +20,7 @@ func TestApproveAcceptsFlagsAfterIDs(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/healthz":
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok\n"))
+			writeTestHealth(w)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/runs/run_1/approvals":
 			got.path = r.URL.Path
 			got.auth = r.Header.Get("Authorization")
@@ -81,7 +80,7 @@ func TestFixSendsAbsolutePathsFromAnotherDirectory(t *testing.T) {
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
-			w.WriteHeader(http.StatusOK)
+			writeTestHealth(w)
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs" {
@@ -164,7 +163,7 @@ func TestFixDoesNotSubstituteSampleScript(t *testing.T) {
 	posts := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
-			w.WriteHeader(http.StatusOK)
+			writeTestHealth(w)
 			return
 		}
 		posts++
@@ -188,7 +187,7 @@ func TestProviderFlagRespectsEnvironment(t *testing.T) {
 	var got string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
-			w.WriteHeader(http.StatusOK)
+			writeTestHealth(w)
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/v1/runs" {

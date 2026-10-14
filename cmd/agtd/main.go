@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,6 +26,7 @@ import (
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/telemetry"
 	"github.com/csy20/agt/internal/usage"
+	"github.com/csy20/agt/internal/version"
 	"github.com/csy20/agt/internal/workspace"
 )
 
@@ -133,8 +137,15 @@ func run() int {
 	srv.Cleanup = func(c context.Context) (int, error) {
 		return runner.Sweep(c, lookup(c))
 	}
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		slog.Error("listen", "err", err)
+		return 1
+	}
+	defer ln.Close()
+	removeMarks := writeDaemonMarks(cfg)
+	defer removeMarks()
 	httpServer := &http.Server{
-		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -144,10 +155,22 @@ func run() int {
 		defer cancel()
 		_ = httpServer.Shutdown(shut)
 	}()
-	slog.Info("listening", "addr", cfg.ListenAddr, "data_dir", cfg.DataDir)
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	slog.Info("listening", "addr", cfg.ListenAddr, "data_dir", cfg.DataDir, "log", filepath.Join(cfg.DataDir, "agtd.log"), "version", version.Product)
+	if err := httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("http", "err", err)
 		return 1
 	}
+	slog.Info("stopped", "addr", cfg.ListenAddr)
 	return 0
+}
+
+func writeDaemonMarks(cfg config.Config) func() {
+	pidPath := filepath.Join(cfg.DataDir, "agtd.pid")
+	addrPath := filepath.Join(cfg.DataDir, "agtd.addr")
+	_ = os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600)
+	_ = os.WriteFile(addrPath, []byte("http://"+cfg.ListenAddr+"\n"), 0o600)
+	return func() {
+		_ = os.Remove(pidPath)
+		_ = os.Remove(addrPath)
+	}
 }

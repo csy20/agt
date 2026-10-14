@@ -49,7 +49,7 @@ func runValueFlags(budget bool) map[string]bool {
 	flags := map[string]bool{
 		"repo": true, "provider": true, "script": true, "server": true,
 		"goal": true, "profile": true, "workdir": true, "memory": true,
-		"timeout": true, "pids": true, "test-arg": true,
+		"timeout": true, "pids": true, "test-arg": true, "model": true,
 	}
 	if budget {
 		flags["budget-cents"] = true

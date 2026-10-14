@@ -13,7 +13,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "forbidden")
 			return
 		}
-		if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+		if r.Method == http.MethodGet && (r.URL.Path == "/healthz" || r.URL.Path == "/v1/identity") {
 			next.ServeHTTP(w, r)
 			return
 		}

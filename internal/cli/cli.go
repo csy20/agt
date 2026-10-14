@@ -1,10 +1,9 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,11 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"errors"
-
 	"github.com/csy20/agt/internal/auth"
 	"github.com/csy20/agt/internal/config"
-	"github.com/csy20/agt/internal/usage"
 	"github.com/csy20/agt/internal/version"
 )
 
@@ -41,6 +37,10 @@ func Run(args []string) int {
 		return approve(args[2:])
 	case "run":
 		return runCmd(args[2:])
+	case "doctor":
+		return doctor(args[2:])
+	case "completion":
+		return completion(args[2:])
 	case "help", "-h", "--help":
 		usageText()
 		return 0
@@ -58,8 +58,9 @@ func usageText() {
   agt fix --repo PATH --profile go --test-arg go --test-arg test --test-arg ./... "goal"
   agt profile detect --repo PATH
   agt run create --goal TEXT --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE
-  agt run status RUN
-  agt run attach RUN
+  agt run list [--limit N] [--json]
+  agt run status RUN [--json]
+  agt run attach RUN [--json]
   agt run diff RUN
   agt run export RUN --output FILE
   agt run apply RUN --digest DIGEST
@@ -69,17 +70,21 @@ func usageText() {
   agt run cancel RUN
   agt run cleanup
   agt approve RUN COMMAND --args-hash HASH
+  agt doctor [--json]
+  agt completion bash|zsh|fish|powershell
   agt version
 
 --profile is required. --repo does not select a language or a test command.
 agt profile detect prints a suggestion and does not start a run.
---provider defaults to AGT_PROVIDER. There is no silent provider.
+--provider defaults to AGT_PROVIDER. --model checks AGT_MODEL_NAME on agtd and does not call a hosted model.
 The fake provider is a labelled scripted demo, not a live model.
-The control plane is agtd. agt starts it when that binary sits beside agt and nothing is listening.
-agt sends the local token from AGT_TOKEN or $AGT_DATA_DIR/auth.token on every route except health.
+The control plane is agtd. agt starts it when that binary sits beside agt and the daemon identity matches this client.
+agt sends the local token from AGT_TOKEN or $AGT_DATA_DIR/auth.token. GET /healthz and GET /v1/identity do not use the token.
 agt run diff and agt run export review the snapshot. agt run apply writes the source repository only after --digest matches that artifact.
-Leaving agt run attach does not cancel the run and does not apply the change. agt run cancel does.
+Leaving agt run attach, including Ctrl+C, does not cancel the run and does not apply the change. agt run cancel does.
 A dollar cap is not enforced when model prices are zero or the provider reports no usage.
+Set NO_COLOR to keep the progress lines plain. --json prints machine-readable output.
+agt doctor names the next command when Docker, Postgres, the token, the listen address, the images, or the daemon version fail.
 `)
 }
 
@@ -91,6 +96,8 @@ func fix(args []string) int {
 	scriptFlag := fs.String("script", "", "fake-provider script JSON")
 	budget := fs.Int("budget-cents", 100, "run budget in cents")
 	server := fs.String("server", "", "agtd base URL")
+	modelFlag := fs.String("model", "", "require this AGT_MODEL_NAME on agtd")
+	asJSON := fs.Bool("json", false, "print events as JSON")
 	pf := addProfileFlags(fs)
 	if err := fs.Parse(reorderFlags(args, runValueFlags(true))); err != nil {
 		return 2
@@ -120,6 +127,10 @@ func fix(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	if err := matchModel(base, *modelFlag); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 	body := map[string]any{
 		"goal": goal, "repo_path": repo, "provider": provider, "budget_cents": *budget,
 		"profile": profilePayload(prof),
@@ -141,7 +152,7 @@ func fix(args []string) int {
 		return 1
 	}
 	fmt.Printf("run %s\n", created.RunID)
-	return attach(base, created.RunID)
+	return attach(base, created.RunID, *asJSON)
 }
 
 func runCmd(args []string) int {
@@ -152,28 +163,12 @@ func runCmd(args []string) int {
 	switch args[0] {
 	case "create":
 		return create(args[1:])
+	case "list":
+		return listCmd(args[1:])
 	case "status":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: agt run status RUN")
-			return 2
-		}
-		base, err := ensureServer("")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return printStatus(base, args[1])
+		return statusCmd(args[1:])
 	case "attach":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: agt run attach RUN")
-			return 2
-		}
-		base, err := ensureServer("")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return attach(base, args[1])
+		return attachCmd(args[1:])
 	case "diff":
 		return diffCmd(args[1:])
 	case "export":
@@ -204,6 +199,7 @@ func create(args []string) int {
 	providerFlag := fs.String("provider", "", "fake or openai; defaults to AGT_PROVIDER")
 	scriptFlag := fs.String("script", "", "fake-provider script")
 	server := fs.String("server", "", "agtd base URL")
+	modelFlag := fs.String("model", "", "require this AGT_MODEL_NAME on agtd")
 	pf := addProfileFlags(fs)
 	if err := fs.Parse(reorderFlags(args, runValueFlags(false))); err != nil {
 		return 2
@@ -231,6 +227,10 @@ func create(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
+	}
+	if err := matchModel(base, *modelFlag); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
 	}
 	body := map[string]any{
 		"goal": *goal, "repo_path": repo, "provider": provider,
@@ -314,21 +314,6 @@ func approve(args []string) int {
 	return 0
 }
 
-func printStatus(base, runID string) int {
-	var view map[string]any
-	if err := getJSON(base+"/v1/runs/"+runID, &view); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	fmt.Printf("state %v\n", view["state"])
-	if n, ok := asInt64(view["usage_micros"]); ok {
-		fmt.Printf("usage %s\n", usage.USD(n))
-	}
-	raw, _ := json.MarshalIndent(view, "", "  ")
-	fmt.Println(string(raw))
-	return 0
-}
-
 func asInt64(v any) (int64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -346,85 +331,6 @@ func asInt64(v any) (int64, bool) {
 	}
 }
 
-func attach(base, runID string) int {
-	req, err := http.NewRequest(http.MethodGet, base+"/v1/runs/"+runID+"/events?stream=1&after=0", nil)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if err := setAuth(req); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "events: %s\n", strings.TrimSpace(string(body)))
-		return 1
-	}
-	if err := readSSE(resp.Body, func(event string, data []byte) {
-		if line := formatEvent(event, data); line != "" {
-			fmt.Println(line)
-		}
-	}); err != nil && !errorsIsEOF(err) {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	var view struct {
-		State       string          `json:"state"`
-		SpentMicros int64           `json:"spent_micros"`
-		Worktree    string          `json:"worktree"`
-		Error       string          `json:"error"`
-		Result      json.RawMessage `json:"result"`
-	}
-	if err := getJSON(base+"/v1/runs/"+runID, &view); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if len(view.Result) > 0 && string(view.Result) != "null" {
-		var result struct {
-			Summary string `json:"summary"`
-			Diff    string `json:"diff"`
-			Tests   struct {
-				Passed bool   `json:"passed"`
-				Output string `json:"output"`
-			} `json:"tests"`
-		}
-		_ = json.Unmarshal(view.Result, &result)
-		fmt.Printf("\n%s\ncost %s\n", result.Summary, usage.USD(view.SpentMicros))
-		if result.Diff != "" {
-			fmt.Printf("\n%s", result.Diff)
-			if !strings.HasSuffix(result.Diff, "\n") {
-				fmt.Println()
-			}
-		}
-	} else {
-		fmt.Printf("state %s\ncost %s\n", view.State, usage.USD(view.SpentMicros))
-	}
-	if view.Worktree != "" {
-		fmt.Printf("worktree %s\n", view.Worktree)
-	}
-	switch view.State {
-	case "SUCCEEDED":
-		return 0
-	case "AWAITING_APPROVAL":
-		fmt.Fprintln(os.Stderr, "approval required: agt approve "+runID+" COMMAND --args-hash HASH")
-		return 3
-	case "PAUSED_BUDGET":
-		return 4
-	default:
-		if view.Error != "" {
-			fmt.Fprintln(os.Stderr, view.Error)
-		}
-		return 1
-	}
-}
-
 func formatEvent(event string, data []byte) string {
 	var payload map[string]any
 	_ = json.Unmarshal(data, &payload)
@@ -434,7 +340,11 @@ func formatEvent(event string, data []byte) string {
 	case "plan.updated":
 		return "plan updated"
 	case "command.finished":
-		return fmt.Sprintf("tool %v exit %v", payload["tool"], payload["exit_code"])
+		line := fmt.Sprintf("tool %v exit %v", payload["tool"], payload["exit_code"])
+		if excerpt := oneLine(payload["output_excerpt"], 120); excerpt != "" {
+			line += " " + excerpt
+		}
+		return line
 	case "command.started":
 		return fmt.Sprintf("tool %v started", payload["tool"])
 	case "approval.requested":
@@ -451,84 +361,28 @@ func formatEvent(event string, data []byte) string {
 		return fmt.Sprintf("workspace captured %v %v", payload["strategy"], payload["revision"])
 	case "patch.applied":
 		return fmt.Sprintf("applied %v files digest %v", payload["files"], payload["digest"])
+	case "verification.failed":
+		return fmt.Sprintf("verification failed exit %v outcome %v", payload["exit_code"], payload["outcome"])
+	case "baseline.recorded":
+		return fmt.Sprintf("baseline exit %v", payload["exit_code"])
 	default:
 		return ""
 	}
 }
 
-func readSSE(r io.Reader, fn func(event string, data []byte)) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 2<<20)
-	var event string
-	var data bytes.Buffer
-	flush := func() {
-		if event == "" && data.Len() == 0 {
-			return
-		}
-		name := event
-		if name == "" {
-			name = "message"
-		}
-		fn(name, append([]byte(nil), data.Bytes()...))
-		event = ""
-		data.Reset()
+func oneLine(v any, n int) string {
+	if v == nil {
+		return ""
 	}
-	for sc.Scan() {
-		line := sc.Text()
-		if line == "" {
-			flush()
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			if data.Len() > 0 {
-				data.WriteByte('\n')
-			}
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
+	s := strings.TrimSpace(fmt.Sprint(v))
+	if s == "" || s == "<nil>" {
+		return ""
 	}
-	flush()
-	if err := sc.Err(); err != nil {
-		return err
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > n {
+		s = s[:n] + "..."
 	}
-	return io.EOF
-}
-
-func ensureServer(explicit string) (string, error) {
-	base := explicit
-	if base == "" {
-		base = os.Getenv("AGT_URL")
-	}
-	if base == "" {
-		base = "http://127.0.0.1:8787"
-	}
-	base = strings.TrimRight(base, "/")
-	if health(base) == nil {
-		return base, nil
-	}
-	if explicit != "" || os.Getenv("AGT_URL") != "" {
-		return "", fmt.Errorf("agtd is not healthy at %s", base)
-	}
-	bin, err := findDaemonBinary()
-	if err != nil {
-		return "", fmt.Errorf("agtd is not running at %s: %w", base, err)
-	}
-	cmd, logPath, err := startDaemon(bin)
-	if err != nil {
-		return "", err
-	}
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		if health(base) == nil {
-			fmt.Fprintf(os.Stderr, "started agtd pid %d (log %s)\n", cmd.Process.Pid, logPath)
-			return base, nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return "", fmt.Errorf("agtd pid %d did not become healthy (log %s)", cmd.Process.Pid, logPath)
+	return s
 }
 
 func startDaemon(bin string) (*exec.Cmd, string, error) {
@@ -567,24 +421,6 @@ func runInputs(providerFlag, repoFlag, scriptFlag string) (provider, repo, scrip
 		return "", "", "", err
 	}
 	return provider, repo, script, nil
-}
-
-func health(base string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/healthz", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("health %d", resp.StatusCode)
-	}
-	return nil
 }
 
 func postJSON(url string, body any, dest any) error {
@@ -657,8 +493,4 @@ func setAuth(req *http.Request) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	return nil
-}
-
-func errorsIsEOF(err error) bool {
-	return err == io.EOF
 }
