@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,8 +29,8 @@ func TestReadAndPatchDecisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if push.Decision != RequireApproval {
-		t.Fatalf("push decision = %s", push.Decision)
+	if push.Decision != Deny || !strings.Contains(push.Reason, "unsupported") {
+		t.Fatalf("push decision = %s reason %s", push.Decision, push.Reason)
 	}
 	mutated, err := Decide("git_push", json.RawMessage(`{"remote":"origin","branch":"main","commit":"abc123"}`))
 	if err != nil {

@@ -110,6 +110,40 @@ open(` + quote(marker) + `, "w").write("nope")
 		t.Fatalf("write escaped to %s (%v)", marker, err)
 	}
 
+	stdout, stderr, code, err = runner.Exec(ctx, work, runID, []string{"python", "-c", `
+import os
+open("/workspace/agt-write-probe", "w").write("ok\n")
+print("UID", os.getuid())
+`})
+	if err != nil || code != 0 {
+		t.Fatalf("write probe exit %d err %v\n%s\n%s", code, err, stdout, stderr)
+	}
+	if strings.Contains(stdout, "UID -1") {
+		t.Fatalf("container uid\n%s", stdout)
+	}
+	probe, err := os.ReadFile(filepath.Join(work, "agt-write-probe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(probe) != "ok\n" {
+		t.Fatalf("probe %q", probe)
+	}
+	ids, err := exec.Command("docker", "ps", "-aq", "--filter", "label=agt-run="+runID).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.TrimSpace(string(ids))
+	if id == "" {
+		t.Fatal("container missing before user inspect")
+	}
+	userOut, err := exec.Command("docker", "inspect", "--format", "{{.Config.User}}", id).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(userOut), "-1") || strings.TrimSpace(string(userOut)) == "" {
+		t.Fatalf("docker user %q", userOut)
+	}
+
 	if err := runner.Destroy(context.Background(), runID); err != nil {
 		t.Fatal(err)
 	}

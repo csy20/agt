@@ -11,13 +11,14 @@ const (
 	Observing        State = "OBSERVING"
 	Verifying        State = "VERIFYING"
 	AwaitingApproval State = "AWAITING_APPROVAL"
-	Committing       State = "COMMITTING"
-	Succeeded        State = "SUCCEEDED"
-	Paused           State = "PAUSED"
-	PausedBudget     State = "PAUSED_BUDGET"
-	Cancelled        State = "CANCELLED"
-	FailedRetryable  State = "FAILED_RETRYABLE"
-	FailedTerminal   State = "FAILED_TERMINAL"
+	// Committing closes the sandbox and records success. It does not create a Git commit.
+	Committing      State = "COMMITTING"
+	Succeeded       State = "SUCCEEDED"
+	Paused          State = "PAUSED"
+	PausedBudget    State = "PAUSED_BUDGET"
+	Cancelled       State = "CANCELLED"
+	FailedRetryable State = "FAILED_RETRYABLE"
+	FailedTerminal  State = "FAILED_TERMINAL"
 )
 
 // IsTerminal reports states that no worker should leave.

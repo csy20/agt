@@ -114,7 +114,7 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		return approval(tool, body, "external mutation"), nil
+		return denied(tool, body, "unsupported: git push is not available and no remote process is spawned"), nil
 	case "pr_open":
 		var args tools.PRArgs
 		if err := decode(raw, &args); err != nil {
@@ -128,7 +128,7 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		return approval(tool, body, "external mutation"), nil
+		return denied(tool, body, "unsupported: opening a pull request is not available and no remote process is spawned"), nil
 	default:
 		return denied(tool, raw, "unknown tool"), nil
 	}
@@ -157,6 +157,9 @@ func allowed(tool string, canonical []byte, reason string) Result {
 	return Result{Tool: tool, Decision: Allow, Canonical: canonical, ArgsHash: hash(tool, canonical), Reason: reason}
 }
 
+// approval builds a require_approval decision. No tool returns one in this
+// build: git_push and pr_open are denied as unsupported. The helper stays so
+// a later exact-action gate uses the same hash binding.
 func approval(tool string, canonical []byte, reason string) Result {
 	return Result{Tool: tool, Decision: RequireApproval, Canonical: canonical, ArgsHash: hash(tool, canonical), Reason: reason}
 }

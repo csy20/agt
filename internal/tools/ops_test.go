@@ -65,6 +65,27 @@ func TestSymlinkEscapeIsNotWritten(t *testing.T) {
 	}
 }
 
+func TestPatchPreservesExecutableBit(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "run.sh")
+	if err := os.WriteFile(file, []byte("echo old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Patch(root, "run.sh", "echo old\n", "echo new\n"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("mode %o", st.Mode().Perm())
+	}
+}
+
 func TestSearchFindsLiteral(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "payments"), 0o755); err != nil {

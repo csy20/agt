@@ -13,6 +13,7 @@ import (
 
 	"github.com/csy20/agt/internal/api"
 	"github.com/csy20/agt/internal/config"
+	"github.com/csy20/agt/internal/diag"
 	"github.com/csy20/agt/internal/model"
 	"github.com/csy20/agt/internal/orch"
 	"github.com/csy20/agt/internal/sandbox"
@@ -45,7 +46,18 @@ func run() int {
 		slog.Error("migrate", "err", err)
 		return 1
 	}
+	if msg := diag.ModelConfigWarning(cfg.Provider, cfg.ModelAPIKey, cfg.ModelName); msg != "" {
+		slog.Warn(msg)
+	}
+	// Tests run only in this Docker runner. There is no host-process fallback.
 	runner := &sandbox.Runner{Image: cfg.SandboxImage}
+	checkCtx, cancelCheck := context.WithTimeout(ctx, 20*time.Second)
+	err = runner.Preflight(checkCtx)
+	cancelCheck()
+	if err != nil {
+		slog.Error(err.Error())
+		return 1
+	}
 	engine := orch.New(orch.Options{
 		Store:   st,
 		DataDir: cfg.DataDir,

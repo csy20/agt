@@ -268,7 +268,7 @@ func (o *Orchestrator) executeOpen(ctx context.Context, current store.Run) error
 func (o *Orchestrator) perform(ctx context.Context, current store.Run, cmd store.Command) (string, int, error) {
 	switch cmd.Tool {
 	case "git_push", "pr_open":
-		return "remote driver is not configured; approval was bound to the canonical command and no process was spawned", 0, nil
+		return "", 2, fmt.Errorf("unsupported tool %s: remote mutations are disabled and no process was spawned", cmd.Tool)
 	}
 	ws, err := o.workspace(ctx, current)
 	if err != nil {
@@ -311,9 +311,12 @@ func (o *Orchestrator) verify(ctx context.Context, current store.Run) error {
 	if err != nil {
 		return err
 	}
-	diff, _, diffErr := ws.Diff(ctx)
+	diff, diffCode, diffErr := ws.Diff(ctx)
 	if diffErr != nil {
-		diff = diffErr.Error()
+		return diffErr
+	}
+	if diffCode != 0 {
+		return fmt.Errorf("git_diff exited %d", diffCode)
 	}
 	decision, err := policy.Decide("run_test", []byte(`{}`))
 	if err != nil {

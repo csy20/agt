@@ -18,6 +18,7 @@ import (
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/orch"
 	"github.com/csy20/agt/internal/run"
+	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/testutil"
 )
 
@@ -75,7 +76,7 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	}
 }
 
-func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
+func TestScriptedPushIsDeniedNotSuccessful(t *testing.T) {
 	st := testutil.Open(t)
 	eng := testutil.NewEngine(t, st, orch.Hooks{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -84,27 +85,79 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 
 	script := []byte(`{"steps":[{"tool":"git_push","args":{"remote":"origin","branch":"agent/demo","commit":"abc123"},"input_tokens":20,"output_tokens":10}]}`)
 	created := eng.Create(t, "push the branch", testutil.Fixture(t), 100, 16, script)
-	current := testutil.WaitState(t, st, created.ID, run.AwaitingApproval, 15*time.Second)
-	time.Sleep(300 * time.Millisecond)
-	before, err := st.MaxSeq(context.Background(), created.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	version := current.StateVersion
+	end := testutil.WaitState(t, st, created.ID, run.FailedTerminal, 15*time.Second)
 	cmds, err := st.ListCommands(context.Background(), created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cmds) != 1 || cmds[0].State != "awaiting_approval" {
+	if len(cmds) != 1 || cmds[0].State != "denied" || cmds[0].Tool != "git_push" {
 		testutil.Dump(t, st, created.ID)
 		t.Fatalf("commands %+v", cmds)
 	}
-	cmd := cmds[0]
+	if !strings.Contains(string(cmds[0].Result), "unsupported") {
+		t.Fatalf("result %s", cmds[0].Result)
+	}
+	if cmds[0].State == "succeeded" {
+		t.Fatal("unsupported push was recorded as succeeded")
+	}
+	if eng.Created() != 0 {
+		t.Fatalf("workspace created %d", eng.Created())
+	}
+	if eng.Runner != nil && eng.Runner.ExecCount() != 0 {
+		t.Fatalf("sandbox execs %d", eng.Runner.ExecCount())
+	}
+	if strings.Contains(strings.ToLower(end.Error), "pushed") {
+		t.Fatalf("run claims a push: %s", end.Error)
+	}
+	assertNoContainer(t, created.ID)
+}
 
+func TestApprovalHashIsBoundAndPushStaysUnsupported(t *testing.T) {
+	st := testutil.Open(t)
+	eng := testutil.NewEngine(t, st, orch.Hooks{})
+	script := []byte(`{"steps":[{"finish":true,"text":"unused"}]}`)
+	created := eng.Create(t, "hold for approval", testutil.Fixture(t), 100, 16, script)
+	ctx := context.Background()
+	cur, err := st.Transition(ctx, created.ID, created.StateVersion, run.Contextualising, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err = st.Transition(ctx, cur.ID, cur.StateVersion, run.Planning, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err = st.CommitModelIntent(ctx, cur.ID, cur.StateVersion, store.Intent{
+		Kind:         "tool",
+		Tool:         "git_push",
+		Canonical:    []byte(`{"branch":"agent/demo","commit":"abc123","remote":"origin"}`),
+		ArgsHash:     "hash-ok",
+		Decision:     "require_approval",
+		Reason:       "external mutation",
+		CommandID:    "cmd_push",
+		InputTokens:  20,
+		OutputTokens: 10,
+		CostMicros:   1,
+		Model:        "fake",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.State != run.AwaitingApproval {
+		t.Fatalf("state %s", cur.State)
+	}
+	workCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go (&orch.Worker{Store: st, Run: eng.Orch.Run}).Loop(workCtx)
+
+	before, err := st.MaxSeq(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := cur.StateVersion
 	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}).Handler())
 	t.Cleanup(ts.Close)
 	wrong := postJSON(t, ts.URL+"/v1/runs/"+created.ID+"/approvals", map[string]any{
-		"command_id": cmd.CommandID,
+		"command_id": "cmd_push",
 		"args_hash":  "deadbeef",
 		"decision":   "approved",
 	}, "")
@@ -112,14 +165,14 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 	if wrong.status != http.StatusConflict {
 		t.Fatalf("wrong hash %d", wrong.status)
 	}
-	after, err := st.MaxSeq(context.Background(), created.ID)
+	after, err := st.MaxSeq(ctx, created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if after != before {
 		t.Fatalf("wrong hash wrote events %d -> %d", before, after)
 	}
-	current, err = st.GetRun(context.Background(), created.ID)
+	current, err := st.GetRun(ctx, created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +184,8 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 	}
 
 	ok := postJSON(t, ts.URL+"/v1/runs/"+created.ID+"/approvals", map[string]any{
-		"command_id": cmd.CommandID,
-		"args_hash":  cmd.ArgsHash,
+		"command_id": "cmd_push",
+		"args_hash":  "hash-ok",
 		"decision":   "approved",
 	}, "")
 	okBody, _ := io.ReadAll(ok.body)
@@ -141,11 +194,11 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 		t.Fatalf("approve %d %s", ok.status, okBody)
 	}
 	end := testutil.WaitState(t, st, created.ID, run.FailedTerminal, 15*time.Second)
-	finished, err := st.GetCommand(context.Background(), created.ID, cmd.CommandID)
+	finished, err := st.GetCommand(ctx, created.ID, "cmd_push")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if finished.State != "succeeded" || !strings.Contains(string(finished.Result), "no process was spawned") {
+	if finished.State == "succeeded" || !strings.Contains(string(finished.Result), "unsupported") {
 		testutil.Dump(t, st, created.ID)
 		t.Fatalf("command %s %s", finished.State, finished.Result)
 	}
@@ -155,7 +208,7 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 	if eng.Runner != nil && eng.Runner.ExecCount() != 0 {
 		t.Fatalf("sandbox execs %d", eng.Runner.ExecCount())
 	}
-	if !strings.Contains(end.Error, "no step") {
+	if !strings.Contains(end.Error, "unsupported") {
 		t.Fatalf("error %q", end.Error)
 	}
 	assertNoContainer(t, created.ID)

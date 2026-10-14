@@ -4,7 +4,7 @@
 
 A run is the durable object in Postgres. The model proposes a tool call. Policy allows it, denies it, or asks for an approval bound to that command's argument hash. Tests run in a per-run container with no network. `git push` and opening a pull request do not spawn a process in this build, even after the hash matches.
 
-The fake provider script lives in `eval/scripts/`, outside the fixture repository, so a search of the repo cannot see the answer.
+The fake provider script lives in `eval/scripts/`, outside the fixture repository, so a search of the repo cannot see the answer. It is a labelled demo. `agt` does not load it unless `--script` is passed, and it is not a live model. `--provider` defaults to `AGT_PROVIDER`. There is no silent provider.
 
 ## Demo
 
@@ -24,11 +24,19 @@ Reattach after the client exits:
 ./bin/agt run attach RUN_ID
 ```
 
-Approve one command, not the conversation:
+Approve one command, not the conversation. Flags may follow the ids:
 
 ```sh
 ./bin/agt approve RUN_ID COMMAND_ID --args-hash HASH
 ```
+
+`git push` and opening a pull request are not offered to the model. A request for either is denied. It is not recorded as a successful push or pull request.
+
+The client converts repository and script paths to absolute paths before sending them, so the daemon's working directory does not choose the repository.
+
+The copied workspace keeps executable bits and project files such as `.github` and `.gitignore`. It skips `.git`, `node_modules`, `vendor`, and common build directories (`build`, `dist`, `target`, and similar). A file over 8 MiB fails the copy. Symlinks are refused.
+
+Unix hosts pass the host uid and gid to Docker. Native Windows uses the unprivileged image user `65532:65532`. The daemon does not pass `-1:-1`, and it does not run tests on the host when Docker is missing.
 
 ## Layout
 

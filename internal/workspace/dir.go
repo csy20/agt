@@ -82,7 +82,7 @@ func (d *Dir) Diff(context.Context) (string, int, error) {
 	d.note("git_diff")
 	out, err := tools.Diff(d.Base, d.Work)
 	if err != nil {
-		return err.Error(), 2, nil
+		return "", 2, err
 	}
 	return out, 0, nil
 }
@@ -119,7 +119,14 @@ func (d *Dir) Close(ctx context.Context) error {
 	return nil
 }
 
-// Materialize copies repo into dataDir/runs/<id>/{work,base}. Symlinks are refused.
+// MaxCopyFileBytes is the largest regular file Materialize will copy.
+// Larger files fail the copy instead of being dropped silently.
+const MaxCopyFileBytes = 8 << 20
+
+// Materialize copies repo into dataDir/runs/<id>/{work,base}.
+// Symlinks are refused. Executable bits are preserved.
+// Dotfiles and dot-directories are included except the directory names
+// reported by tools.SkipDir (.git, node_modules, build outputs, and similar).
 func Materialize(repo, dataDir, runID string) (work, base string, err error) {
 	root := filepath.Join(dataDir, "runs", runID)
 	if err := os.RemoveAll(root); err != nil {
@@ -152,8 +159,12 @@ func copyTree(src, dst string) error {
 		if d.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("refusing to copy symlink %s", rel)
 		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
 		if d.IsDir() {
-			if rel != "." && strings.HasPrefix(d.Name(), ".") {
+			if rel != "." && tools.SkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return os.MkdirAll(target, 0o755)
@@ -161,11 +172,14 @@ func copyTree(src, dst string) error {
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		return copyFile(path, target)
+		if info.Size() > MaxCopyFileBytes {
+			return fmt.Errorf("file %s is %d bytes, over the %d byte copy limit", rel, info.Size(), MaxCopyFileBytes)
+		}
+		return copyFile(path, target, info.Mode())
 	})
 }
 
-func copyFile(src, dst string) error {
+func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -174,13 +188,19 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	perm := mode.Perm()
+	if perm == 0 {
+		perm = 0o644
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return os.Chmod(dst, perm)
 }
 
 // HostPython runs the fixture unittest on the host. The server does not use it.

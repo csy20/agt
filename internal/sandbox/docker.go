@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -20,6 +19,7 @@ type Runner struct {
 
 	mu    sync.Mutex
 	execs int
+	ready bool
 }
 
 func (r *Runner) ExecCount() int {
@@ -39,13 +39,19 @@ func (r *Runner) RunTest(ctx context.Context, worktree, runID string) (string, s
 
 // Exec runs a fixed argv in the run container. Callers must not pass model text as a shell.
 func (r *Runner) Exec(ctx context.Context, worktree, runID string, argv []string) (string, string, int, error) {
+	if err := r.Preflight(ctx); err != nil {
+		return "", "", 0, err
+	}
 	if err := r.ensure(ctx, worktree, runID); err != nil {
 		return "", "", 0, err
 	}
 	r.mu.Lock()
 	r.execs++
 	r.mu.Unlock()
-	user := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	user, err := currentDockerUser()
+	if err != nil {
+		return "", "", 0, err
+	}
 	args := []string{
 		"exec",
 		"--user", user,
@@ -61,7 +67,7 @@ func (r *Runner) Exec(ctx context.Context, worktree, runID string, argv []string
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	if err == nil {
 		return stdout.String(), stderr.String(), 0, nil
 	}
@@ -102,7 +108,10 @@ func (r *Runner) ensure(ctx context.Context, worktree, runID string) error {
 }
 
 func (r *Runner) start(ctx context.Context, name, worktree, runID string) error {
-	user := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	user, err := currentDockerUser()
+	if err != nil {
+		return err
+	}
 	args := []string{
 		"run", "-d",
 		"--name", name,

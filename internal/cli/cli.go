@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/usage"
 	"github.com/csy20/agt/internal/version"
 )
@@ -48,39 +49,42 @@ func Run(args []string) int {
 func usageText() {
 	fmt.Fprint(os.Stderr, `agt is a durable coding-agent terminal.
 
-  agt fix --repo PATH [--provider fake|openai] [--script FILE] "goal"
-  agt run create --goal TEXT --repo PATH
+  agt fix --repo PATH --provider fake --script FILE "goal"
+  agt fix --repo PATH --provider openai "goal"
+  agt run create --goal TEXT --repo PATH --provider fake --script FILE
   agt run status RUN
   agt run attach RUN
   agt approve RUN COMMAND --args-hash HASH
   agt version
 
-The control plane is agtd. agt starts it when the binary sits beside agt and nothing is listening.
+--provider defaults to AGT_PROVIDER. There is no silent provider.
+The fake provider is a labelled scripted demo, not a live model.
+The control plane is agtd. agt starts it when that binary sits beside agt and nothing is listening.
 `)
 }
 
 func fix(args []string) int {
 	fs := flag.NewFlagSet("fix", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	repo := fs.String("repo", "", "repository to copy into a run worktree")
-	provider := fs.String("provider", "fake", "fake or openai")
-	script := fs.String("script", "", "fake-provider script JSON")
+	repoFlag := fs.String("repo", "", "repository to copy into a run worktree")
+	providerFlag := fs.String("provider", "", "fake or openai; defaults to AGT_PROVIDER")
+	scriptFlag := fs.String("script", "", "fake-provider script JSON")
 	budget := fs.Int("budget-cents", 100, "run budget in cents")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{
+		"repo": true, "provider": true, "script": true, "budget-cents": true, "server": true,
+	})); err != nil {
 		return 2
 	}
 	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if goal == "" || *repo == "" {
+	if goal == "" || *repoFlag == "" {
 		fmt.Fprintln(os.Stderr, "fix requires a goal and --repo")
 		return 2
 	}
-	if *provider == "fake" && *script == "" {
-		cand := filepath.Join("eval", "scripts", "fix_retry.json")
-		if _, err := os.Stat(cand); err == nil {
-			abs, _ := filepath.Abs(cand)
-			*script = abs
-		}
+	provider, repo, script, err := runInputs(*providerFlag, *repoFlag, *scriptFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
 	}
 	base, err := ensureServer(*server)
 	if err != nil {
@@ -88,10 +92,10 @@ func fix(args []string) int {
 		return 1
 	}
 	body := map[string]any{
-		"goal": goal, "repo_path": *repo, "provider": *provider, "budget_cents": *budget,
+		"goal": goal, "repo_path": repo, "provider": provider, "budget_cents": *budget,
 	}
-	if *script != "" {
-		body["script_path"] = *script
+	if script != "" {
+		body["script_path"] = script
 	}
 	var created struct {
 		RunID string `json:"run_id"`
@@ -150,15 +154,22 @@ func create(args []string) int {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	goal := fs.String("goal", "", "run goal")
-	repo := fs.String("repo", "", "repository path")
-	provider := fs.String("provider", "fake", "fake or openai")
-	script := fs.String("script", "", "fake-provider script")
+	repoFlag := fs.String("repo", "", "repository path")
+	providerFlag := fs.String("provider", "", "fake or openai; defaults to AGT_PROVIDER")
+	scriptFlag := fs.String("script", "", "fake-provider script")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{
+		"goal": true, "repo": true, "provider": true, "script": true, "server": true,
+	})); err != nil {
 		return 2
 	}
-	if *goal == "" || *repo == "" {
+	if *goal == "" || *repoFlag == "" {
 		fmt.Fprintln(os.Stderr, "create requires --goal and --repo")
+		return 2
+	}
+	provider, repo, script, err := runInputs(*providerFlag, *repoFlag, *scriptFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	base, err := ensureServer(*server)
@@ -166,9 +177,9 @@ func create(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	body := map[string]any{"goal": *goal, "repo_path": *repo, "provider": *provider}
-	if *script != "" {
-		body["script_path"] = *script
+	body := map[string]any{"goal": *goal, "repo_path": repo, "provider": provider}
+	if script != "" {
+		body["script_path"] = script
 	}
 	var created struct {
 		RunID string `json:"run_id"`
@@ -194,7 +205,9 @@ func approve(args []string) int {
 	yes := fs.Bool("yes", false, "approve the command currently stored for this id")
 	decision := fs.String("decision", "approved", "approved or rejected")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{
+		"args-hash": true, "decision": true, "server": true,
+	})); err != nil {
 		return 2
 	}
 	rest := fs.Args()
@@ -433,32 +446,61 @@ func ensureServer(explicit string) (string, error) {
 	if explicit != "" || os.Getenv("AGT_URL") != "" {
 		return "", fmt.Errorf("agtd is not healthy at %s", base)
 	}
-	bin := os.Getenv("AGTD_BIN")
-	if bin == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return "", fmt.Errorf("agtd is not running at %s", base)
-		}
-		bin = filepath.Join(filepath.Dir(exe), "agtd")
+	bin, err := findDaemonBinary()
+	if err != nil {
+		return "", fmt.Errorf("agtd is not running at %s: %w", base, err)
 	}
-	if _, err := os.Stat(bin); err != nil {
-		return "", fmt.Errorf("agtd is not running at %s and %s was not found", base, bin)
-	}
-	cmd := exec.Command(bin)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
+	cmd, logPath, err := startDaemon(bin)
+	if err != nil {
 		return "", err
 	}
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if health(base) == nil {
-			fmt.Fprintf(os.Stderr, "started agtd pid %d\n", cmd.Process.Pid)
+			fmt.Fprintf(os.Stderr, "started agtd pid %d (log %s)\n", cmd.Process.Pid, logPath)
 			return base, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return "", fmt.Errorf("agtd pid %d did not become healthy", cmd.Process.Pid)
+	return "", fmt.Errorf("agtd pid %d did not become healthy (log %s)", cmd.Process.Pid, logPath)
+}
+
+func startDaemon(bin string) (*exec.Cmd, string, error) {
+	dataDir := config.Load().DataDir
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, "", fmt.Errorf("create data dir %s: %w", dataDir, err)
+	}
+	logPath := filepath.Join(dataDir, "agtd.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, "", fmt.Errorf("open daemon log %s: %w", logPath, err)
+	}
+	cmd := exec.Command(bin)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	detachDaemon(cmd)
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return nil, "", fmt.Errorf("start %s: %w", bin, err)
+	}
+	logFile.Close()
+	return cmd, logPath, nil
+}
+
+func runInputs(providerFlag, repoFlag, scriptFlag string) (provider, repo, script string, err error) {
+	provider, err = resolveProvider(providerFlag)
+	if err != nil {
+		return "", "", "", err
+	}
+	repo, err = absolutePath(repoFlag)
+	if err != nil {
+		return "", "", "", err
+	}
+	script, err = prepareFakeScript(provider, scriptFlag)
+	if err != nil {
+		return "", "", "", err
+	}
+	return provider, repo, script, nil
 }
 
 func health(base string) error {

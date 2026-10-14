@@ -29,7 +29,5 @@ func Definitions() []any {
 		fn("git_diff", "Show the uncommitted diff in the run worktree.", object(map[string]any{}, nil)),
 		fn("run_test", "Run the repository test suite inside the sandbox.", object(map[string]any{}, nil)),
 		fn("apply_patch", "Replace one exact occurrence of old text with new text in a worktree file.", object(map[string]any{"path": str, "old": str, "new": str}, []string{"path", "old", "new"})),
-		fn("git_push", "Request a git push. This always requires approval and does not run until granted.", object(map[string]any{"remote": str, "branch": str, "commit": str}, []string{"remote", "branch", "commit"})),
-		fn("pr_open", "Request opening a pull request. This always requires approval.", object(map[string]any{"branch": str, "title": str}, []string{"branch", "title"})),
 	}
 }

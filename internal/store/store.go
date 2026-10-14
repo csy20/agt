@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/csy20/agt/internal/diag"
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/run"
 	"github.com/jackc/pgx/v5"
@@ -95,7 +96,7 @@ func Open(ctx context.Context, url string) (*Store, error) {
 	defer cancel()
 	if err := pool.Ping(pingCtx); err != nil {
 		pool.Close()
-		return nil, err
+		return nil, diag.PostgresUnreachable(url, err)
 	}
 	return &Store{pool: pool}, nil
 }
