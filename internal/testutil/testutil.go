@@ -121,6 +121,10 @@ type Engine struct {
 	runIDs  []string
 	dirs    []*workspace.Dir
 	images  profile.Images
+
+	// Provider, when set, answers model turns. ProviderName is stored on the run.
+	Provider     model.Provider
+	ProviderName string
 }
 
 func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
@@ -139,6 +143,9 @@ func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 		},
 		Hooks: hooks,
 		ModelFor: func(current store.Run) (model.Provider, error) {
+			if eng.Provider != nil {
+				return eng.Provider, nil
+			}
 			script, err := model.ParseScript(current.ScriptJSON)
 			if err != nil {
 				return nil, err
@@ -212,7 +219,7 @@ func (e *Engine) CreateWithProfile(t *testing.T, goal, repo string, budget, maxS
 		MaxSteps:     maxSteps,
 		WallSeconds:  300,
 		AgentVersion: version.Compute(e.images.Python, e.images.Go, e.images.Node),
-		Provider:     "fake",
+		Provider:     providerName(e),
 		RequestHash:  id.New("req_"),
 		ScriptJSON:   script,
 		ProfileJSON:  raw,
@@ -261,6 +268,13 @@ func TestImages(t *testing.T) profile.Images {
 		}
 	}
 	return profile.Images{Python: python, Go: goImage, Node: node}
+}
+
+func providerName(e *Engine) string {
+	if e.ProviderName != "" {
+		return e.ProviderName
+	}
+	return "fake"
 }
 
 func (e *Engine) Created() int {

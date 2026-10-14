@@ -80,6 +80,24 @@ func TestWriteAndDeleteStayInsideTheTree(t *testing.T) {
 	}
 }
 
+func TestTestEditsRequireApproval(t *testing.T) {
+	write, err := Decide("write_file", json.RawMessage(`{"path":"tests/test_retry.py","content":"x","before_sha256":""}`))
+	if err != nil || write.Decision != RequireApproval {
+		t.Fatalf("python test write %+v %v", write, err)
+	}
+	patch, err := Decide("apply_patch", json.RawMessage(`{"path":"counter_test.go","old":"a","new":"b"}`))
+	if err != nil || patch.Decision != RequireApproval {
+		t.Fatalf("go test patch %+v %v", patch, err)
+	}
+	del, err := Decide("delete_file", json.RawMessage(`{"path":"quote.test.js","before_sha256":"`+strings.Repeat("ab", 32)+`"}`))
+	if err != nil || del.Decision != RequireApproval {
+		t.Fatalf("js test delete %+v %v", del, err)
+	}
+	if write.ArgsHash == "" || write.ArgsHash != hash("write_file", write.Canonical) {
+		t.Fatal("approval hash is not bound to the canonical arguments")
+	}
+}
+
 func TestUnknownToolDenied(t *testing.T) {
 	res, err := Decide("shell", json.RawMessage(`{"cmd":"rm -rf /"}`))
 	if err != nil {

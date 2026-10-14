@@ -110,6 +110,9 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
+		if tools.IsTestPath(rel) {
+			return approval(tool, body, "edits that change test files require approval"), nil
+		}
 		return allowed(tool, body, "workspace write inside the run worktree"), nil
 	case "write_file":
 		var write tools.WriteArgs
@@ -137,6 +140,9 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
+		if tools.IsTestPath(rel) {
+			return approval(tool, body, "edits that change test files require approval"), nil
+		}
 		return allowed(tool, body, "workspace write inside the run worktree"), nil
 	case "delete_file":
 		var del tools.DeleteArgs
@@ -159,6 +165,9 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		body, err := json.Marshal(del)
 		if err != nil {
 			return Result{}, err
+		}
+		if tools.IsTestPath(rel) {
+			return approval(tool, body, "edits that change test files require approval"), nil
 		}
 		return allowed(tool, body, "workspace delete inside the run worktree"), nil
 	case "git_push":
@@ -232,9 +241,8 @@ func allowed(tool string, canonical []byte, reason string) Result {
 	return Result{Tool: tool, Decision: Allow, Canonical: canonical, ArgsHash: hash(tool, canonical), Reason: reason}
 }
 
-// approval builds a require_approval decision. No tool returns one in this
-// build: git_push and pr_open are denied as unsupported. The helper stays so
-// a later exact-action gate uses the same hash binding.
+// approval binds a later human decision to the canonical arguments.
+// git_push and pr_open stay denied. Test-file edits use this gate.
 func approval(tool string, canonical []byte, reason string) Result {
 	return Result{Tool: tool, Decision: RequireApproval, Canonical: canonical, ArgsHash: hash(tool, canonical), Reason: reason}
 }

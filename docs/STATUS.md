@@ -1,6 +1,6 @@
 # AGT status
 
-Updated 14 October 2026 on branch `milestone-3-profiles`, based on `milestone-2-authority` at `4a4924aaae5a974ea63297645bbd7f11f5291567`.
+Updated 14 October 2026 on branch `milestone-4-repair`, based on `milestone-3-profiles` at `a62f1e6c22675b8c3bbb46e14deccb8193bef176`.
 This file records what the code and the checks actually show. A passing fake-provider demo is not a live-model repair. A cross-compile is not native execution. A skipped integration test is not support.
 
 ## Milestone 1
@@ -29,7 +29,7 @@ A colon in a relative path is rejected on every OS. That blocks Windows drive le
 
 ## Milestone 3
 
-Implemented on this branch. The production test command is the profile argv. `internal/sandbox/docker.go` does not default to `python -m unittest tests.test_retry`. Passing `--repo` does not select a language or a test target. `agt fix` and `agt run create` exit 2 without `--profile` and do not POST. `agt profile detect` prints a suggestion and exits 0 without creating a run.
+Implemented on `milestone-3-profiles` and still present here. The production test command is the profile argv. `internal/sandbox/docker.go` does not default to `python -m unittest tests.test_retry`. Passing `--repo` does not select a language or a test target. `agt fix` and `agt run create` exit 2 without `--profile` and do not POST. `agt profile detect` prints a suggestion and exits 0 without creating a run.
 
 | Control | Where | Check |
 |---|---|---|
@@ -44,13 +44,33 @@ The Go profile env sets `GOPROXY=off`, `GOSUMDB=off`, `GOTOOLCHAIN=local`, and `
 
 `internal/testutil` runs the profile on the host only when none of `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, and `AGT_IMAGE_NODE` is set. If any one is set, all three must be set and must exist. That host path is not container support. Production `cmd/agtd` uses `sandbox.Runner` only.
 
+## Milestone 4
+
+Implemented on this branch. The model proposes one action. The supervisor decides whether verification may continue. Repository text stays out of the system prompt.
+
+| Control | Where | Check |
+|---|---|---|
+| Contract `transcript.v1`. Table `model_messages` stores role, content, tool call id, tool name, and arguments. The assistant row and a denied tool row are written in the same transaction as the command. A successful tool row is written by `FinishCommand` for the latest assistant call that has no tool reply. Tool text is redacted and clipped and prefixed `DATA origin=tool:<name>`. The command row keeps the original output | `internal/store/migrations/003_transcript.sql`, `internal/store/transcript.go`, `internal/store/commands.go` | `TestRepairLoopReturnsAfterAFailedPatch` and `TestLoopbackAdapterRepairsPayrepo` require a later tool row for an assistant `tool_call_id`, contract `transcript.v1`, and a system message without `DATA origin` |
+| One tool call per turn. More than one call is an error that names every `id:name`. None of those calls is executed. The request does not send `parallel_tool_calls`. An empty id becomes `call_1` in the adapter. The orchestrator fills `call_` plus the command id when the provider leaves it empty, before the intent is committed | `internal/model/openai.go`, `internal/orch/orch.go` | `TestOpenAIRejectsMultipleToolCalls`. The loopback repair test links `call_run` from the assistant turn to the next request |
+| The first request asks for a stream, `max_tokens` (default 2048), and `stream_options.include_usage`. One HTTP 400 whose body mentions stream, max tokens, or usage falls back to a minimal body and does not spend the attempt budget. JSON bodies still parse. SSE chunks assemble one call by index. The body cap is 1 MiB | `internal/model/openai.go` | `TestOpenAIFallsBackWhenStreamingIsRejected`, `TestOpenAIStreamsOneToolCall`, `TestOpenAIParsesToolCall` |
+| HTTP 429 and status 500 or higher retry inside `Complete`, before a command is committed, up to `MaxAttempts` (default 3), with backoff `try * 20ms` capped at 1 second. Context cancellation returns immediately. 401, 403, and other 400 responses are not retried after the one capability fallback | `internal/model/openai.go` | `TestOpenAIRetriesRateLimitOnce`, `TestOpenAICancelDoesNotRetry` |
+| A loopback base URL (`http` or `https` on `localhost`, `::1`, or a loopback IP) may omit `AGT_MODEL_API_KEY`, and the request then sends no `Authorization` header. Any other base URL, including the default `https://api.openai.com/v1`, requires the key. `AGT_MODEL_NAME` is always required for the openai provider | `internal/model/openai.go`, `internal/api/server.go`, `internal/diag/diag.go` | `TestOpenAILoopbackOmitsTheAPIKey`, `TestHealthIdempotencyAndOpenAIGuard` (a loopback create with a model name and no key fails on the missing profile; an empty cloud name and key still mentions `AGT_MODEL_API_KEY`) |
+| Request budget is 6000 estimated tokens, `(len+3)/4`. `model.Fit` keeps system messages, the first user message, and a user message prefixed `DATA origin=repo-summary`. Omitted turns become one user message `DATA origin=transcript-summary` with sequence, role, tool, tool call id, an 8-byte sha256, and an 80-character excerpt. That summary is not copied into the system prompt. The live path sends `req.Transcript` when it is non-empty | `internal/model/context.go`, `internal/orch/orch.go` | `TestFitSummarizesOldTurnsWithoutTouchingTheSystemPrompt` |
+| During `CONTEXTUALISING`, before any model call, the run stores the system prompt, the goal, and `workspace.SummarizeRepo` of the source repository. That seed does not create a worktree. The summary skips secret directories and files, skipped directories, and symlinks. A root `README.md` excerpt is capped at 1500 bytes and tagged as data. A plan object is attached to the outbound request as `DATA origin=plan`. It is not written into the transcript on every turn | `internal/orch/orch.go`, `internal/workspace/summary.go` | `TestBudgetPauseBeforeSideEffects` still has no worktree and no sandbox exec. `TestSummarizeRepoSkipsSecretsAndTagsTheReadme` |
+| `VERIFYING` may return to `OBSERVING`. On failure, while step and cost budget remain, fewer than two returns have happened, and the failure fingerprint is new, the sandbox stays open and a user message `DATA origin=verification` is appended. A repeated fingerprint, a third failure, or an exhausted budget is terminal and closes the sandbox. The fingerprint replaces `\d+\.\d+s` with `0s` | `internal/run/state.go`, `internal/orch/orch.go` | `TestRepairLoopReturnsAfterAFailedPatch`, `TestRepeatedVerificationStops`. State test allows `Verifying` to `Observing` |
+| The first finished `run_test` before any succeeded `apply_patch`, `write_file`, or `delete_file` records `baseline.recorded`. Outcome `repaired` requires that baseline exit to be non-zero, a later mutation, a passing verification, and no test-file edit. Other terminal labels are `verification_failed`, `verification_failed_budget`, `repeated_verification`, `baseline_already_passed`, `passed_without_edit`, `baseline_missing`, `passed_after_test_edit`, and `verification_unavailable`. `passed_after_test_edit` is a success label | `internal/orch/orch.go` | The repair tests assert `repaired` and `repeated_verification`. The other labels are implemented and were not each given an end-to-end run in `make test` |
+| `apply_patch`, `write_file`, and `delete_file` on a test path require approval. Test paths are `*_test.go`, `*.test.js`, `*.test.mjs`, `*.test.cjs`, `*.test.ts`, `*.spec.js`, `*.spec.ts`, `test_*.py`, and anything under `tests/`. Reading a test file stays allowed | `internal/tools/testpath.go`, `internal/policy/policy.go` | `TestTestEditsRequireApproval`. `make test` did not approve a test-file edit and then pass verification |
+| The same mutation argument hash is denied with `this edit already succeeded` after one success. If that hash has also been denied, the run fails with `repeated ineffective edit` before the intent is committed | `internal/orch/orch.go` | `TestRepeatedEditStops` |
+
+`TestLoopbackAdapterRepairsPayrepo` is a local `httptest` server on `127.0.0.1` that speaks chat completions over SSE. It drove the payrepo retry fixture through a plan, a failing test, a docstring-only patch, a failed verification, the idempotent charge patch, and a passing verification. The source fixture was unchanged, the result outcome was `repaired`, and the model name was `local-repair`. That server is not OpenAI's hosted API. A hosted smoke was not run because it was not opted in. No API key was printed. The fake-provider scripts remain labelled demos.
+
 ## Checks run on this machine
 
 Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 via `deploy/compose.yaml` on `127.0.0.1:54329`.
 
-- `make test` passed. It builds `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`, exports those tags, and runs `go test ./...`. `internal/api` passed in about 9 seconds, `internal/orch` in about 55 seconds, and `internal/sandbox` in about 4 seconds. `TestSandboxRunsTestsAndStaysClosed` ran against the Python image. `TestGoAndJavaScriptProfilesRepairDistinctFailures` ran `go test ./...` in `agt-sandbox:go` and `node --test` in `agt-sandbox:node`. The first `go test` failed, the scripted `write_file` applied, and the verifier passed. The source fixtures were unchanged.
-- `make demo` exited 0. The client and daemon both used `AGT_DATA_DIR=/tmp/agt-demo`. The token file was mode `600` and the directory was mode `700`. The command passed `--profile python` and the four unittest argv entries. The payrepo retry fixture was repaired inside the sandbox. The provider line identified the scripted demo. Run id `run_0c3fc8d8e0165c95`. The demo output did not print the token.
-- `GOOS=windows GOARCH=amd64`, `GOOS=darwin GOARCH=amd64`, `GOOS=darwin GOARCH=arm64`, and `GOOS=linux GOARCH=arm64` `go test -c` succeeded for `cmd/agtd`, `internal/api`, `internal/cli`, `internal/config`, `internal/orch`, `internal/policy`, `internal/profile`, `internal/sandbox`, `internal/store`, `internal/tools`, and `internal/workspace`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The scratch binaries were deleted. The Linux amd64 binaries used by `make test` and `make demo` were executed.
+- `make test` passed on this branch. It builds `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`, exports those tags, and runs `go test ./...`. `internal/api` passed in about 7 seconds, `internal/store` in about 22 seconds, `internal/orch` in about 74 seconds, and `internal/sandbox` in about 4 seconds. The orchestrator package included the repair-loop tests and `TestLoopbackAdapterRepairsPayrepo` against the Python image. `TestGoAndJavaScriptProfilesRepairDistinctFailures` ran `go test ./...` in `agt-sandbox:go` and `node --test` in `agt-sandbox:node`. The source fixtures were unchanged.
+- `make demo` was not re-run on this branch. The Milestone 3 demo still applies to the fake-provider path: it exited 0 with `AGT_DATA_DIR=/tmp/agt-demo`, token mode `600`, directory mode `700`, `--profile python`, and run id `run_0c3fc8d8e0165c95`. That demo is not the loopback adapter test.
+- `CGO_ENABLED=0` `go test -c` for `windows/amd64`, `darwin/amd64`, `darwin/arm64`, and `linux/arm64` succeeded for `cmd/agtd`, `internal/api`, `internal/model`, `internal/orch`, `internal/policy`, `internal/store`, `internal/tools`, `internal/workspace`, `internal/diag`, and `internal/run`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The scratch binaries were deleted. `internal/auth` was not cross-compiled on this branch. The Linux amd64 binaries used by `make test` were executed.
 
 `internal/testutil.Open` still skips when Postgres is unreachable and `AGT_DATABASE_URL` is unset. That skip is not evidence of database support. `make test` sets the URL and fails if Postgres is down. A `go test` that does not export the three image variables may use the host runner. Do not record that run as container support.
 
@@ -61,14 +81,14 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 | CLI fix / run / approve / version | Partial | Commands above work and send the local token. `fix` and `run create` require `--profile`. `profile detect` only suggests. No run list, cancel, pause, resume, diff export, or local apply |
 | Daemon and API | Partial | Health is open. Other routes require the local token. Listen is loopback-only. Postgres required. Create rejects a missing profile and a client-supplied image |
 | Run lifecycle | Partial | States and compare-and-swap exist. `COMMITTING` is not a Git commit. Several states have no user workflow |
-| Persistence | Partial | `001_init.sql` plus `002_profile.sql` (`profile_json`). Job leases are still 30 seconds and are not renewed |
-| Agent loop | Partial | Fake-provider fixtures complete for one Python, one Go, and one JavaScript failure. No live-model repair loop |
+| Persistence | Partial | `001_init.sql`, `002_profile.sql` (`profile_json`), and `003_transcript.sql` (`model_messages`). Job leases are still 30 seconds and are not renewed |
+| Agent loop | Partial | A failing verification can return to the model while budget remains. `TestLoopbackAdapterRepairsPayrepo` repaired payrepo through a local OpenAI-compatible server. Fake-provider fixtures remain demos. No hosted-model run |
 | Tools | Partial | Search, read, exact replace, hash-preconditioned write and delete, in-process diff. The test argv comes from the profile. Secret paths are denied |
-| Policy | Partial | Allow, deny, and approval hashing remain. Push and pull request are denied. Secret paths and escapes are denied for write and delete |
+| Policy | Partial | Allow, deny, and approval hashing remain. Push and pull request are denied. Secret paths and escapes are denied for write and delete. Test-file edits require approval |
 | Isolation | Partial on Linux | Three per-language images, one workspace mount, no network, dropped capabilities, resource limits from the profile, filtered docker CLI environment, host uid on Linux. `/tmp` is executable and `nosuid`. Windows user id is selected in code and was not run |
-| Model adapter | Partial | OpenAI-compatible chat completions. No streaming or retries. API key still required. Only the first tool call is used. Observations are redacted |
+| Model adapter | Partial | OpenAI-compatible chat completions, one streamed tool call, a single capability fallback, and retries for 429 and 5xx. A loopback base URL may omit the API key. A cloud URL requires it. More than one tool call is rejected. A hosted model was not called |
 | Accounting | Partial | Token estimate after the model call. Not a hard spend cap |
-| Tests | Partial | Unit and Linux Docker/Postgres checks above. Three scripted repair fixtures |
+| Tests | Partial | Unit and Linux Docker/Postgres checks above. Three scripted repair fixtures plus the verification-return and loopback adapter tests |
 | Telemetry | Partial | JSON logs and optional OTLP. Not a quality measure |
 | Windows native | Unverified | Cross-compile, including the junction test in `internal/tools`. ACL code was cross-compiled in Milestone 2 and was not executed. No Windows execution |
 | macOS | Unverified | Darwin cross-compile only. Bind-mount uid behavior is not measured |
@@ -77,7 +97,7 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 
 ## Not in this branch
 
-Milestones 4–8 from the 14 October 2026 audit are not done. In particular: a live repair loop, patch export and local apply, lease renewal, cancel/pause/resume, installable release artifacts, and an evaluation set of unfamiliar tasks. The three fixtures use the fake provider. They are not evidence that a live model repaired a repository.
+Milestones 5–8 from the 14 October 2026 audit are not done. In particular: patch export and local apply, lease renewal, cancel/pause/resume, installable release artifacts, and an evaluation set of unfamiliar tasks. The loopback adapter test is a local OpenAI-compatible server. It is not evidence that a hosted model repaired a repository. The fake-provider fixtures remain labelled demos.
 
 The roadmap is not complete.
 

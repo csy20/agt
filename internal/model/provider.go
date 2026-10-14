@@ -18,6 +18,7 @@ type Request struct {
 	System         string
 	Plan           json.RawMessage
 	Observations   []Observation
+	Transcript     []Turn
 	CompletedCalls int
 }
 
@@ -26,6 +27,8 @@ type Response struct {
 	Plan         json.RawMessage
 	Tool         string
 	Args         json.RawMessage
+	ToolCallID   string
+	ModelName    string
 	Finish       bool
 	InputTokens  int
 	OutputTokens int

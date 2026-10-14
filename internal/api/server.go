@@ -167,8 +167,8 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		}
 		script = encoded
 	}
-	if provider == "openai" && (s.Config.ModelAPIKey == "" || s.Config.ModelName == "") {
-		writeError(w, http.StatusBadRequest, "AGT_MODEL_API_KEY and AGT_MODEL_NAME are required for the openai provider")
+	if provider == "openai" && (s.Config.ModelName == "" || (s.Config.ModelAPIKey == "" && !model.LoopbackURL(s.Config.ModelBaseURL))) {
+		writeError(w, http.StatusBadRequest, "AGT_MODEL_NAME is required for the openai provider. AGT_MODEL_API_KEY is required unless AGT_MODEL_BASE_URL is a loopback URL")
 		return
 	}
 	profReq, err := decodeProfile(req.Profile)

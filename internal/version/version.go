@@ -20,6 +20,7 @@ func Compute(images ...string) string {
 		policy.Version,
 		tools.Version,
 		model.PromptVersion,
+		model.TranscriptContract,
 		profile.Contract,
 	}
 	lines = append(lines, images...)

@@ -61,7 +61,7 @@ func run() int {
 		slog.Error("migrate", "err", err)
 		return 1
 	}
-	if msg := diag.ModelConfigWarning(cfg.Provider, cfg.ModelAPIKey, cfg.ModelName); msg != "" {
+	if msg := diag.ModelConfigWarning(cfg.Provider, cfg.ModelAPIKey, cfg.ModelName, cfg.ModelBaseURL); msg != "" {
 		slog.Warn(msg)
 	}
 	// Tests run only in this Docker runner. There is no host-process fallback.

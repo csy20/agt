@@ -25,13 +25,16 @@ func TestRedactDatabaseURLHidesPassword(t *testing.T) {
 }
 
 func TestModelConfigWarning(t *testing.T) {
-	if ModelConfigWarning("fake", "", "") != "" {
+	if ModelConfigWarning("fake", "", "", "") != "" {
 		t.Fatal("fake provider warned")
 	}
-	if ModelConfigWarning("openai", "key", "model") != "" {
+	if ModelConfigWarning("openai", "key", "model", "https://api.openai.com/v1") != "" {
 		t.Fatal("complete openai config warned")
 	}
-	msg := ModelConfigWarning("openai", "", "")
+	if ModelConfigWarning("openai", "", "local", "http://127.0.0.1:9/v1") != "" {
+		t.Fatal("loopback endpoint warned about a missing key")
+	}
+	msg := ModelConfigWarning("openai", "", "", "")
 	if !strings.Contains(msg, "AGT_MODEL_API_KEY") || !strings.Contains(msg, "AGT_MODEL_NAME") {
 		t.Fatalf("warning %s", msg)
 	}

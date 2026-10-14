@@ -2,7 +2,7 @@
 
 `agt` is a local agentic terminal for one workflow: make a failing test pass, show the diff, and stop before any remote side effect. The CLI is a client. `agtd` is the control plane. It accepts only a loopback `AGT_LISTEN`: `127.0.0.1`, another address in `127.0.0.0/8`, `::1`, or the literal name `localhost`. `0.0.0.0`, an empty host, and other interfaces are rejected at startup.
 
-A run is the durable object in Postgres. The model proposes a tool call. Policy allows it, denies it, or asks for an approval bound to that command's argument hash. Tests run in a per-run container with no network. `git push` and opening a pull request do not spawn a process in this build, even after the hash matches.
+A run is the durable object in Postgres. The model proposes one tool call. Policy allows it, denies it, or asks for an approval bound to that command's argument hash. Tests run in a per-run container with no network. A failed verification returns to the model while step and cost budget remain. The same failure twice, or a repeated edit that already ran, stops the run. The transcript is stored with the run. Repository summaries, plans, and tool output stay in data messages, and the system prompt does not receive them. Edits that change test files require approval. `git push` and opening a pull request do not spawn a process in this build, even after the hash matches.
 
 The fake provider script lives in `eval/scripts/`, outside the fixture repository, so a search of the repo cannot see the answer. It is a labelled demo. `agt` does not load it unless `--script` is passed, and it is not a live model. `--provider` defaults to `AGT_PROVIDER`. There is no silent provider.
 
@@ -56,7 +56,7 @@ Every route except `GET /healthz` requires `Authorization: Bearer` with the toke
 | `eval/fixtures/jsquote` | Buggy JavaScript sample |
 | `eval/scripts/` | Scripted model steps, kept outside the fixtures |
 
-`agtd` reads `AGT_DATABASE_URL`, `AGT_SANDBOX_IMAGE`, `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, `AGT_IMAGE_NODE`, `AGT_LISTEN`, `AGT_DATA_DIR`, and `AGT_PROVIDER`. Set `AGT_TOKEN` to choose the local bearer token; otherwise `agtd` creates `$AGT_DATA_DIR/auth.token`. An OpenAI-compatible provider is selected with `--provider openai` plus `AGT_MODEL_BASE_URL`, `AGT_MODEL_API_KEY`, and `AGT_MODEL_NAME`. Set `AGT_OTLP_ENDPOINT` to export traces; export failure does not fail the run.
+`agtd` reads `AGT_DATABASE_URL`, `AGT_SANDBOX_IMAGE`, `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, `AGT_IMAGE_NODE`, `AGT_LISTEN`, `AGT_DATA_DIR`, and `AGT_PROVIDER`. Set `AGT_TOKEN` to choose the local bearer token; otherwise `agtd` creates `$AGT_DATA_DIR/auth.token`. An OpenAI-compatible provider is selected with `--provider openai`, `AGT_MODEL_BASE_URL`, and `AGT_MODEL_NAME`. `AGT_MODEL_API_KEY` is required unless the base URL is loopback (`localhost`, `::1`, or a loopback address). The default base URL is `https://api.openai.com/v1`. Set `AGT_OTLP_ENDPOINT` to export traces; export failure does not fail the run.
 
 ## Not in this build
 

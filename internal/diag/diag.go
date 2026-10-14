@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+
+	"github.com/csy20/agt/internal/model"
 )
 
 // PostgresUnreachable describes a failed database connection without the password.
@@ -13,14 +15,15 @@ func PostgresUnreachable(databaseURL string, cause error) error {
 }
 
 // ModelConfigWarning is empty when the selected provider has the settings it needs.
-func ModelConfigWarning(provider, apiKey, modelName string) string {
+// A loopback AGT_MODEL_BASE_URL may omit the API key. A cloud endpoint may not.
+func ModelConfigWarning(provider, apiKey, modelName, baseURL string) string {
 	if provider != "openai" {
 		return ""
 	}
-	if apiKey != "" && modelName != "" {
+	if modelName != "" && (apiKey != "" || model.LoopbackURL(baseURL)) {
 		return ""
 	}
-	return "AGT_PROVIDER=openai but AGT_MODEL_API_KEY or AGT_MODEL_NAME is empty. Requests that use openai will be rejected until both are set and agtd is restarted. AGT_MODEL_BASE_URL selects the endpoint (default https://api.openai.com/v1)"
+	return "AGT_PROVIDER=openai needs AGT_MODEL_NAME. A cloud AGT_MODEL_BASE_URL also needs AGT_MODEL_API_KEY. A loopback base URL may omit the key. Restart agtd after changing them. The default base URL is https://api.openai.com/v1"
 }
 
 // RedactDatabaseURL hides a password embedded in a Postgres URL.

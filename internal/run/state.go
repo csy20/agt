@@ -40,7 +40,7 @@ var forward = map[State][]State{
 	Planning:         {Executing, Observing, Verifying, AwaitingApproval},
 	Executing:        {Observing, AwaitingApproval, Verifying},
 	Observing:        {Planning, Executing, Verifying, AwaitingApproval},
-	Verifying:        {AwaitingApproval, Committing, Succeeded},
+	Verifying:        {Observing, AwaitingApproval, Committing, Succeeded},
 	AwaitingApproval: {Executing, Committing, Observing},
 	Committing:       {Succeeded},
 	Paused:           {Planning},

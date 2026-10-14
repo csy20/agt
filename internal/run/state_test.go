@@ -27,4 +27,7 @@ func TestCanRejectsIllegalAndTerminal(t *testing.T) {
 	if !Can(AwaitingApproval, Cancelled) {
 		t.Fatal("approval can be cancelled")
 	}
+	if !Can(Verifying, Observing) {
+		t.Fatal("a failed verification can return to observing")
+	}
 }

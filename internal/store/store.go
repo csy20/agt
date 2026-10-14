@@ -113,7 +113,10 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.applyMigration(ctx, 1, "migrations/001_init.sql"); err != nil {
 		return err
 	}
-	return s.applyMigration(ctx, 2, "migrations/002_profile.sql")
+	if err := s.applyMigration(ctx, 2, "migrations/002_profile.sql"); err != nil {
+		return err
+	}
+	return s.applyMigration(ctx, 3, "migrations/003_transcript.sql")
 }
 
 func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
@@ -164,7 +167,7 @@ func (s *Store) migrationApplied(ctx context.Context, version int) (bool, error)
 
 func (s *Store) Reset(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
-		TRUNCATE usage_entries, approvals, commands, run_events, run_jobs, runs
+		TRUNCATE model_messages, usage_entries, approvals, commands, run_events, run_jobs, runs
 		RESTART IDENTITY CASCADE`)
 	return err
 }

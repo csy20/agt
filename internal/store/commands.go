@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/csy20/agt/internal/redact"
@@ -36,6 +37,8 @@ type Intent struct {
 	Reason       string
 	CommandID    string
 	Text         string
+	ToolCallID   string
+	ModelName    string
 	InputTokens  int
 	OutputTokens int
 	CostMicros   int64
@@ -120,7 +123,11 @@ func (s *Store) CommitModelIntent(ctx context.Context, runID string, fromVersion
 		if _, err := appendEvent(ctx, tx, runID, "model.called", "model", nonempty(in.Model, "model"), map[string]any{
 			"kind": in.Kind, "tool": in.Tool, "input_tokens": in.InputTokens,
 			"output_tokens": in.OutputTokens, "cost_micros": in.CostMicros, "text": in.Text,
+			"model_name": in.ModelName, "tool_call_id": in.ToolCallID,
 		}); err != nil {
+			return err
+		}
+		if err := appendAssistantMessage(ctx, tx, runID, in); err != nil {
 			return err
 		}
 		if in.Kind == "tool" {
@@ -186,6 +193,9 @@ func insertIntentCommand(ctx context.Context, tx pgx.Tx, runID string, in Intent
 		eventType = "command.finished"
 		payload["exit_code"] = 2
 		payload["output_excerpt"] = clip(redact.Text(in.Reason), 500)
+		if err := appendToolMessage(ctx, tx, runID, in.ToolCallID, in.Tool, in.Reason, 2); err != nil {
+			return err
+		}
 	case "require_approval":
 		state = "awaiting_approval"
 		eventType = "approval.requested"
@@ -242,17 +252,85 @@ func (s *Store) FinishCommand(ctx context.Context, commandID, state string, resu
 	if err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE commands
-		SET state=$2, result=$3::jsonb, updated_at=now()
-		WHERE command_id=$1 AND state IN ('pending', 'approved')`, commandID, state, string(body))
+	var parsed struct {
+		ExitCode int    `json:"exit_code"`
+		Output   string `json:"output"`
+	}
+	_ = json.Unmarshal(body, &parsed)
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		var runID, tool string
+		err := tx.QueryRow(ctx, `SELECT run_id, tool FROM commands WHERE command_id=$1`, commandID).Scan(&runID, &tool)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := lockRun(ctx, tx, runID); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE commands
+			SET state=$2, result=$3::jsonb, updated_at=now()
+			WHERE command_id=$1 AND state IN ('pending', 'approved')`, commandID, state, string(body))
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return appendToolResult(ctx, tx, runID, tool, parsed.Output, parsed.ExitCode)
+	})
+}
+
+func appendAssistantMessage(ctx context.Context, tx pgx.Tx, runID string, in Intent) error {
+	msg := TranscriptMessage{Role: "assistant", Content: in.Text}
+	if in.Kind == "tool" {
+		args := string(in.Canonical)
+		if args == "" {
+			args = "{}"
+		}
+		msg.ToolCallID = in.ToolCallID
+		msg.ToolName = in.Tool
+		msg.Arguments = args
+	}
+	return appendTranscript(ctx, tx, runID, msg)
+}
+
+func appendToolResult(ctx context.Context, tx pgx.Tx, runID, tool, output string, exitCode int) error {
+	var id, name string
+	err := tx.QueryRow(ctx, `
+		SELECT tool_call_id, tool_name FROM model_messages
+		WHERE run_id=$1 AND role='assistant' AND tool_call_id <> ''
+		  AND NOT EXISTS (
+		    SELECT 1 FROM model_messages later
+		    WHERE later.run_id=model_messages.run_id AND later.role='tool' AND later.tool_call_id=model_messages.tool_call_id
+		  )
+		ORDER BY seq DESC
+		LIMIT 1`, runID).Scan(&id, &name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return ErrConflict
+	if name != "" && tool != "" && name != tool {
+		return fmt.Errorf("pending tool call %s does not match %s", name, tool)
 	}
-	return nil
+	return appendToolMessage(ctx, tx, runID, id, name, output, exitCode)
+}
+
+func appendToolMessage(ctx context.Context, tx pgx.Tx, runID, toolCallID, tool, output string, exitCode int) error {
+	if toolCallID == "" {
+		return nil
+	}
+	content := "DATA origin=tool:" + tool + "\nexit=" + strconv.Itoa(exitCode) + "\n" + clip(redact.Text(output), 4000)
+	return appendTranscript(ctx, tx, runID, TranscriptMessage{
+		Role:       "tool",
+		Content:    content,
+		ToolCallID: toolCallID,
+		ToolName:   tool,
+	})
 }
 
 func (s *Store) RecordSystemCommand(ctx context.Context, runID, commandID, tool, argsHash string, canonical []byte, output string, exitCode int) error {

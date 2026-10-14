@@ -69,6 +69,18 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	if openai.status != http.StatusBadRequest || !strings.Contains(openai.body, "AGT_MODEL_API_KEY") {
 		t.Fatalf("openai guard %d %s", openai.status, openai.body)
 	}
+	localSrv := httptest.NewServer(api.New(st, config.Config{
+		Provider:     "openai",
+		ModelName:    "local-model",
+		ModelBaseURL: "http://127.0.0.1:9/v1",
+	}, testToken).Handler())
+	defer localSrv.Close()
+	local := postRun(t, localSrv.URL, map[string]any{
+		"goal": "local model", "repo_path": testutil.Fixture(t), "provider": "openai",
+	}, "idem-local")
+	if local.status != http.StatusBadRequest || strings.Contains(local.body, "AGT_MODEL_API_KEY") || !strings.Contains(local.body, "profile") {
+		t.Fatalf("loopback key guard %d %s", local.status, local.body)
+	}
 
 	view := getJSON(t, ts.URL+"/v1/runs/"+first.runID)
 	if _, ok := view["script_json"]; ok {
