@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"errors"
+
 	"github.com/csy20/agt/internal/auth"
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/usage"
@@ -33,6 +35,8 @@ func Run(args []string) int {
 		return 0
 	case "fix":
 		return fix(args[2:])
+	case "profile":
+		return profileCommand(args[2:])
 	case "approve":
 		return approve(args[2:])
 	case "run":
@@ -50,14 +54,17 @@ func Run(args []string) int {
 func usageText() {
 	fmt.Fprint(os.Stderr, `agt is a durable coding-agent terminal.
 
-  agt fix --repo PATH --provider fake --script FILE "goal"
-  agt fix --repo PATH --provider openai "goal"
-  agt run create --goal TEXT --repo PATH --provider fake --script FILE
+  agt fix --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE "goal"
+  agt fix --repo PATH --profile go --test-arg go --test-arg test --test-arg ./... "goal"
+  agt profile detect --repo PATH
+  agt run create --goal TEXT --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE
   agt run status RUN
   agt run attach RUN
   agt approve RUN COMMAND --args-hash HASH
   agt version
 
+--profile is required. --repo does not select a language or a test command.
+agt profile detect prints a suggestion and does not start a run.
 --provider defaults to AGT_PROVIDER. There is no silent provider.
 The fake provider is a labelled scripted demo, not a live model.
 The control plane is agtd. agt starts it when that binary sits beside agt and nothing is listening.
@@ -73,14 +80,23 @@ func fix(args []string) int {
 	scriptFlag := fs.String("script", "", "fake-provider script JSON")
 	budget := fs.Int("budget-cents", 100, "run budget in cents")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{
-		"repo": true, "provider": true, "script": true, "budget-cents": true, "server": true,
-	})); err != nil {
+	pf := addProfileFlags(fs)
+	if err := fs.Parse(reorderFlags(args, runValueFlags(true))); err != nil {
 		return 2
 	}
 	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if goal == "" || *repoFlag == "" {
 		fmt.Fprintln(os.Stderr, "fix requires a goal and --repo")
+		return 2
+	}
+	prof, err := pf.request()
+	if err != nil {
+		if errors.Is(err, errProfileRequired) {
+			fmt.Fprintln(os.Stderr, "fix requires --profile. Passing --repo does not select a language or a test command.")
+			printSuggestion(*repoFlag)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		return 2
 	}
 	provider, repo, script, err := runInputs(*providerFlag, *repoFlag, *scriptFlag)
@@ -95,6 +111,7 @@ func fix(args []string) int {
 	}
 	body := map[string]any{
 		"goal": goal, "repo_path": repo, "provider": provider, "budget_cents": *budget,
+		"profile": profilePayload(prof),
 	}
 	if script != "" {
 		body["script_path"] = script
@@ -160,13 +177,22 @@ func create(args []string) int {
 	providerFlag := fs.String("provider", "", "fake or openai; defaults to AGT_PROVIDER")
 	scriptFlag := fs.String("script", "", "fake-provider script")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{
-		"goal": true, "repo": true, "provider": true, "script": true, "server": true,
-	})); err != nil {
+	pf := addProfileFlags(fs)
+	if err := fs.Parse(reorderFlags(args, runValueFlags(false))); err != nil {
 		return 2
 	}
 	if *goal == "" || *repoFlag == "" {
 		fmt.Fprintln(os.Stderr, "create requires --goal and --repo")
+		return 2
+	}
+	prof, err := pf.request()
+	if err != nil {
+		if errors.Is(err, errProfileRequired) {
+			fmt.Fprintln(os.Stderr, "create requires --profile. Passing --repo does not select a language or a test command.")
+			printSuggestion(*repoFlag)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		return 2
 	}
 	provider, repo, script, err := runInputs(*providerFlag, *repoFlag, *scriptFlag)
@@ -179,7 +205,10 @@ func create(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	body := map[string]any{"goal": *goal, "repo_path": repo, "provider": provider}
+	body := map[string]any{
+		"goal": *goal, "repo_path": repo, "provider": provider,
+		"profile": profilePayload(prof),
+	}
 	if script != "" {
 		body["script_path"] = script
 	}

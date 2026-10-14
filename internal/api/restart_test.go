@@ -42,6 +42,7 @@ func TestServerRestartKeepsTheEventLog(t *testing.T) {
 		"provider":    "fake",
 		"script_path": filepath.Join(root, "eval", "scripts", "fix_retry.json"),
 		"max_steps":   0,
+		"profile":     pythonProfile(),
 	}
 	created := postRun(t, base, body, "idem-restart")
 	if created.status != http.StatusAccepted && created.status != http.StatusOK {

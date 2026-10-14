@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/csy20/agt/internal/diag"
 	"github.com/csy20/agt/internal/id"
+	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/run"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -24,7 +26,7 @@ const runColumns = `
 id, idempotency_key, request_hash, goal, repo_path, worktree, state, state_version,
 risk_level, budget_cents, spent_micros, agent_version, trace_id, provider, script_path,
 COALESCE(script_json, 'null'::jsonb), COALESCE(plan_json, 'null'::jsonb), COALESCE(result_json, 'null'::jsonb),
-error, step_count, max_steps, deadline_at, created_at, updated_at`
+error, step_count, max_steps, deadline_at, created_at, updated_at, profile_json`
 
 type Store struct {
 	pool *pgxpool.Pool
@@ -55,6 +57,7 @@ type Run struct {
 	Deadline       time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	ProfileJSON    json.RawMessage
 }
 
 type Event struct {
@@ -80,6 +83,7 @@ type CreateInput struct {
 	Provider       string
 	ScriptPath     string
 	ScriptJSON     json.RawMessage
+	ProfileJSON    json.RawMessage
 }
 
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -106,24 +110,28 @@ func (s *Store) Close() { s.pool.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	applied, err := s.migrationApplied(ctx, 1)
-	if err != nil {
+	if err := s.applyMigration(ctx, 1, "migrations/001_init.sql"); err != nil {
 		return err
 	}
-	if applied {
-		return nil
+	return s.applyMigration(ctx, 2, "migrations/002_profile.sql")
+}
+
+func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
+	applied, err := s.migrationApplied(ctx, version)
+	if err != nil || applied {
+		return err
 	}
-	sqlBytes, err := migrationFS.ReadFile("migrations/001_init.sql")
+	sqlBytes, err := migrationFS.ReadFile(name)
 	if err != nil {
 		return err
 	}
 	return s.withTx(ctx, func(tx pgx.Tx) error {
 		for _, stmt := range splitSQL(string(sqlBytes)) {
 			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("migration: %w", err)
+				return fmt.Errorf("migration %d: %w", version, err)
 			}
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES (1)`)
+		_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, version)
 		return err
 	})
 }
@@ -188,24 +196,33 @@ func (s *Store) CreateRun(ctx context.Context, in CreateInput) (Run, bool, error
 	if len(in.ScriptJSON) > 0 {
 		script = string(in.ScriptJSON)
 	}
+	profileJSON := in.ProfileJSON
+	if len(bytes.TrimSpace(profileJSON)) == 0 {
+		profileJSON = []byte(`{}`)
+	}
+	var identity any
+	if parsed, err := profile.Parse(profileJSON); err == nil {
+		identity = parsed.Identity()
+	}
 	var out Run
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO runs (
 				id, idempotency_key, request_hash, goal, repo_path, state, state_version,
 				budget_cents, agent_version, trace_id, provider, script_path, script_json,
-				max_steps, deadline_at
+				max_steps, deadline_at, profile_json
 			) VALUES (
-				$1,$2,$3,$4,$5,'CREATED',1,$6,$7,$8,$9,$10,$11::jsonb,$12,$13
+				$1,$2,$3,$4,$5,'CREATED',1,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb
 			)`,
 			in.ID, in.IdempotencyKey, in.RequestHash, in.Goal, in.RepoPath, in.BudgetCents,
 			in.AgentVersion, in.TraceID, in.Provider, in.ScriptPath, script, in.MaxSteps, deadline,
+			string(profileJSON),
 		)
 		if err != nil {
 			return err
 		}
 		if _, err := appendEvent(ctx, tx, in.ID, "run.created", "user", "local", map[string]any{
-			"goal": in.Goal, "repo_path": in.RepoPath, "provider": in.Provider,
+			"goal": in.Goal, "repo_path": in.RepoPath, "provider": in.Provider, "profile": identity,
 		}); err != nil {
 			return err
 		}
@@ -371,13 +388,13 @@ func lockRun(ctx context.Context, tx pgx.Tx, runID string) (Run, error) {
 func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	var state string
-	var script, plan, result []byte
+	var script, plan, result, profileJSON []byte
 	err := row.Scan(
 		&r.ID, &r.IdempotencyKey, &r.RequestHash, &r.Goal, &r.RepoPath, &r.Worktree,
 		&state, &r.StateVersion, &r.RiskLevel, &r.BudgetCents, &r.SpentMicros,
 		&r.AgentVersion, &r.TraceID, &r.Provider, &r.ScriptPath,
 		&script, &plan, &result, &r.Error, &r.StepCount, &r.MaxSteps,
-		&r.Deadline, &r.CreatedAt, &r.UpdatedAt,
+		&r.Deadline, &r.CreatedAt, &r.UpdatedAt, &profileJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Run{}, ErrNotFound
@@ -389,6 +406,7 @@ func scanRun(row pgx.Row) (Run, error) {
 	r.ScriptJSON = script
 	r.Plan = plan
 	r.Result = result
+	r.ProfileJSON = profileJSON
 	return r, nil
 }
 

@@ -298,6 +298,18 @@ func (o *Orchestrator) perform(ctx context.Context, current store.Run, cmd store
 			return err.Error(), 2, nil
 		}
 		return ws.Patch(ctx, args.Path, args.Old, args.New)
+	case "write_file":
+		var write tools.WriteArgs
+		if err := json.Unmarshal(cmd.Canonical, &write); err != nil {
+			return err.Error(), 2, nil
+		}
+		return ws.Write(ctx, write)
+	case "delete_file":
+		var del tools.DeleteArgs
+		if err := json.Unmarshal(cmd.Canonical, &del); err != nil {
+			return err.Error(), 2, nil
+		}
+		return ws.Delete(ctx, del)
 	default:
 		return "unsupported tool", 2, nil
 	}

@@ -16,18 +16,9 @@ func (r *Runner) Preflight(ctx context.Context) error {
 		return nil
 	}
 	r.mu.Unlock()
-	if err := preflight(ctx, r.Image); err != nil {
-		return err
-	}
-	r.mu.Lock()
-	r.ready = true
-	r.mu.Unlock()
-	return nil
-}
-
-func preflight(ctx context.Context, image string) error {
-	if strings.TrimSpace(image) == "" {
-		return fmt.Errorf("sandbox image is not configured. Set AGT_SANDBOX_IMAGE and build it with `make image`. agt does not run tests on the host")
+	images := r.Images.List()
+	if len(images) == 0 {
+		return fmt.Errorf("sandbox image is not configured. Set AGT_IMAGE_PYTHON, AGT_IMAGE_GO, and AGT_IMAGE_NODE. AGT_SANDBOX_IMAGE still selects the Python image. Build them with `make image`. agt does not run tests on the host")
 	}
 	if _, err := exec.LookPath("docker"); err != nil {
 		return fmt.Errorf("docker was not found on PATH. Install Docker and start its daemon. agt runs tests only inside a container and does not fall back to the host")
@@ -35,9 +26,14 @@ func preflight(ctx context.Context, image string) error {
 	if out, err := dockerCommand(ctx, "info").CombinedOutput(); err != nil {
 		return fmt.Errorf("docker is installed but the daemon is not reachable. Start Docker and retry. %s", clipOut(out))
 	}
-	if out, err := dockerCommand(ctx, "image", "inspect", "--format", "{{.Id}}", image).CombinedOutput(); err != nil {
-		return fmt.Errorf("sandbox image %q is not available. Build it with `make image` or set AGT_SANDBOX_IMAGE to an image that exists. %s", image, clipOut(out))
+	for _, image := range images {
+		if out, err := dockerCommand(ctx, "image", "inspect", "--format", "{{.Id}}", image).CombinedOutput(); err != nil {
+			return fmt.Errorf("sandbox image %q is not available. Build it with `make image`. %s", image, clipOut(out))
+		}
 	}
+	r.mu.Lock()
+	r.ready = true
+	r.mu.Unlock()
 	return nil
 }
 

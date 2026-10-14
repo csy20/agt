@@ -20,6 +20,25 @@ type PatchArgs struct {
 	New  string `json:"new"`
 }
 
+type WriteArgs struct {
+	Path         string `json:"path"`
+	Content      string `json:"content"`
+	BeforeSHA256 string `json:"before_sha256"`
+}
+
+type DeleteArgs struct {
+	Path         string `json:"path"`
+	BeforeSHA256 string `json:"before_sha256"`
+}
+
+// FileResult records a create, edit, or delete. Hashes are lowercase SHA-256.
+type FileResult struct {
+	Path         string `json:"path"`
+	BeforeSHA256 string `json:"before_sha256"`
+	AfterSHA256  string `json:"after_sha256"`
+	Action       string `json:"action"`
+}
+
 type PushArgs struct {
 	Remote string `json:"remote"`
 	Branch string `json:"branch"`

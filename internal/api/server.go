@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/model"
+	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/version"
@@ -55,19 +58,24 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 type createRequest struct {
-	Goal        string `json:"goal"`
-	RepoPath    string `json:"repo_path"`
-	BudgetCents *int   `json:"budget_cents"`
-	MaxSteps    *int   `json:"max_steps"`
-	WallSeconds *int   `json:"wall_seconds"`
-	Provider    string `json:"provider"`
-	ScriptPath  string `json:"script_path"`
+	Goal        string          `json:"goal"`
+	RepoPath    string          `json:"repo_path"`
+	BudgetCents *int            `json:"budget_cents"`
+	MaxSteps    *int            `json:"max_steps"`
+	WallSeconds *int            `json:"wall_seconds"`
+	Provider    string          `json:"provider"`
+	ScriptPath  string          `json:"script_path"`
+	Profile     json.RawMessage `json:"profile"`
 }
 
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "read body")
+		return
+	}
+	if imageField(body) {
+		writeError(w, http.StatusBadRequest, "image is not accepted; the daemon selects the profile image")
 		return
 	}
 	var req createRequest
@@ -163,7 +171,23 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "AGT_MODEL_API_KEY and AGT_MODEL_NAME are required for the openai provider")
 		return
 	}
-	hash := requestHash(req.Goal, repo, budget, maxSteps, wall, provider, script)
+	profReq, err := decodeProfile(req.Profile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	images := s.Config.ProfileImages()
+	resolved, err := profile.Resolve(profReq, images, runtime.GOARCH)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	profileJSON, err := resolved.Canonical()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "profile")
+		return
+	}
+	hash := requestHash(req.Goal, repo, budget, maxSteps, wall, provider, script, profileJSON)
 	created, isNew, err := s.Store.CreateRun(r.Context(), store.CreateInput{
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 		RequestHash:    hash,
@@ -172,10 +196,11 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		BudgetCents:    budget,
 		MaxSteps:       maxSteps,
 		WallSeconds:    wall,
-		AgentVersion:   version.Compute(s.Config.SandboxImage),
+		AgentVersion:   version.Compute(images.Python, images.Go, images.Node),
 		Provider:       provider,
 		ScriptPath:     scriptPath,
 		ScriptJSON:     script,
+		ProfileJSON:    profileJSON,
 	})
 	if errors.Is(err, store.ErrIdempotency) {
 		writeError(w, http.StatusConflict, err.Error())
@@ -356,11 +381,49 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
-func requestHash(goal, repo string, budget, steps, wall int, provider string, script []byte) string {
+func requestHash(goal, repo string, budget, steps, wall int, provider string, script, profileJSON []byte) string {
 	sum := sha256.New()
 	fmt.Fprintf(sum, "%s\n%s\n%d\n%d\n%d\n%s\n", goal, repo, budget, steps, wall, provider)
 	sum.Write(script)
+	sum.Write([]byte("\n"))
+	sum.Write(profileJSON)
 	return hex.EncodeToString(sum.Sum(nil))
+}
+
+func imageField(body []byte) bool {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return false
+	}
+	if _, ok := top["image"]; ok {
+		return true
+	}
+	raw, ok := top["profile"]
+	if !ok {
+		return false
+	}
+	var prof map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &prof); err != nil {
+		return false
+	}
+	_, ok = prof["image"]
+	return ok
+}
+
+func decodeProfile(raw json.RawMessage) (profile.Request, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return profile.Request{}, fmt.Errorf("profile is required")
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var req profile.Request
+	if err := dec.Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "unknown field") {
+			return profile.Request{}, fmt.Errorf("profile only accepts name, argv, workdir, timeout_seconds, memory, pids, and prepare")
+		}
+		return profile.Request{}, fmt.Errorf("profile: %s", err.Error())
+	}
+	return req, nil
 }
 
 type runViewBody struct {
@@ -381,6 +444,7 @@ type runViewBody struct {
 	Error        string          `json:"error,omitempty"`
 	Plan         json.RawMessage `json:"plan,omitempty"`
 	Result       json.RawMessage `json:"result,omitempty"`
+	Profile      json.RawMessage `json:"profile,omitempty"`
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
 }
@@ -408,6 +472,12 @@ func runView(current store.Run) runViewBody {
 	}
 	if len(current.Result) > 0 && string(current.Result) != "null" {
 		view.Result = current.Result
+	}
+	if parsed, err := profile.Parse(current.ProfileJSON); err == nil {
+		raw, err := json.Marshal(parsed.Identity())
+		if err == nil {
+			view.Profile = raw
+		}
 	}
 	return view
 }

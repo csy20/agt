@@ -45,6 +45,7 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 		"script_path":  filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
 		"budget_cents": 100,
 		"max_steps":    0,
+		"profile":      pythonProfile(),
 	}
 	first := postRun(t, ts.URL, body, "idem-1")
 	if first.status != http.StatusAccepted {
@@ -75,6 +76,52 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	}
 	if view["usage_micros"] == nil {
 		t.Fatal("run view missing usage_micros")
+	}
+	prof, _ := view["profile"].(map[string]any)
+	argv, _ := prof["argv"].([]any)
+	image, _ := prof["image"].(string)
+	if prof["name"] != "python" || image == "" || len(argv) != 4 {
+		t.Fatalf("profile %#v", view["profile"])
+	}
+
+	missing := postRun(t, ts.URL, map[string]any{
+		"goal": "no profile", "repo_path": testutil.Fixture(t), "provider": "fake",
+		"script_path": filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+	}, "idem-noprofile")
+	if missing.status != http.StatusBadRequest || !strings.Contains(missing.body, "profile") {
+		t.Fatalf("missing profile %d %s", missing.status, missing.body)
+	}
+	imaged := postRun(t, ts.URL, map[string]any{
+		"goal": "image", "repo_path": testutil.Fixture(t), "provider": "fake",
+		"script_path": filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+		"profile":     map[string]any{"name": "python", "argv": []string{"python"}, "image": "evil:latest"},
+	}, "idem-image")
+	if imaged.status != http.StatusBadRequest || !strings.Contains(imaged.body, "image") {
+		t.Fatalf("image field %d %s", imaged.status, imaged.body)
+	}
+	goRepo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(goRepo, "go.mod"), []byte("module example.com/x\n\ngo 1.23.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kept := postRun(t, ts.URL, map[string]any{
+		"goal": "stay on python", "repo_path": goRepo, "provider": "fake",
+		"script_path": filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+		"profile":     pythonProfile(),
+	}, "idem-keep-python")
+	if kept.status != http.StatusAccepted {
+		t.Fatalf("explicit profile %d %s", kept.status, kept.body)
+	}
+	keptView := getJSON(t, ts.URL+"/v1/runs/"+kept.runID)
+	keptProfile, _ := keptView["profile"].(map[string]any)
+	if keptProfile["name"] != "python" {
+		t.Fatalf("repo marker overrode the profile: %#v", keptView["profile"])
+	}
+}
+
+func pythonProfile() map[string]any {
+	return map[string]any{
+		"name": "python",
+		"argv": []string{"python", "-m", "unittest", "tests.test_retry"},
 	}
 }
 

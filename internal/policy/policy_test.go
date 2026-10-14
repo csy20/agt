@@ -65,6 +65,21 @@ func TestSecretPathsAreDenied(t *testing.T) {
 	}
 }
 
+func TestWriteAndDeleteStayInsideTheTree(t *testing.T) {
+	ok, err := Decide("write_file", json.RawMessage(`{"path":"counter.go","content":"package p\n","before_sha256":""}`))
+	if err != nil || ok.Decision != Allow {
+		t.Fatalf("write %+v %v", ok, err)
+	}
+	secret, err := Decide("delete_file", json.RawMessage(`{"path":".env","before_sha256":"`+strings.Repeat("ab", 32)+`"}`))
+	if err != nil || secret.Decision != Deny {
+		t.Fatalf("secret delete %+v %v", secret, err)
+	}
+	shell, err := Decide("write_file", json.RawMessage(`{"path":"../x","content":"a","before_sha256":""}`))
+	if err != nil || shell.Decision != Deny {
+		t.Fatalf("escape write %+v %v", shell, err)
+	}
+}
+
 func TestUnknownToolDenied(t *testing.T) {
 	res, err := Decide("shell", json.RawMessage(`{"cmd":"rm -rf /"}`))
 	if err != nil {

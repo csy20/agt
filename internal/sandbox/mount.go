@@ -5,13 +5,20 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
 // containerRunArgs is the docker run argv for one run container.
 // The only bind mount is the run workspace at /workspace.
-func containerRunArgs(image, name, worktree, runID, user, extraLabel string) ([]string, error) {
+// Network is always none. Docker's default tmpfs is noexec, so /tmp must set
+// exec: Go writes and runs the test binary there. The root filesystem stays
+// read-only and nosuid stays set.
+func containerRunArgs(spec ExecSpec, name, worktree, runID, user, extraLabel string) ([]string, error) {
 	if err := validateMountSource(worktree); err != nil {
+		return nil, err
+	}
+	if err := validateExecSpec(spec); err != nil {
 		return nil, err
 	}
 	args := []string{
@@ -20,36 +27,37 @@ func containerRunArgs(image, name, worktree, runID, user, extraLabel string) ([]
 		"--label", "agt-run=" + runID,
 		"--network", "none",
 		"--read-only",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-		"--memory", "256m",
-		"--cpus", "1",
-		"--pids-limit", "64",
+		"--tmpfs", "/tmp:rw,exec,nosuid,size=128m",
+		"--memory", spec.Memory,
+		"--cpus", spec.CPUs,
+		"--pids-limit", strconv.Itoa(spec.PIDs),
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--user", user,
-		"-e", "HOME=/tmp",
-		"-e", "PYTHONDONTWRITEBYTECODE=1",
-		"-w", "/workspace",
-		"--mount", "type=bind,src=" + worktree + ",dst=/workspace",
 	}
+	for _, item := range spec.Env {
+		args = append(args, "-e", item)
+	}
+	args = append(args,
+		"-w", "/workspace",
+		"--mount", "type=bind,src="+worktree+",dst=/workspace",
+	)
 	if extraLabel != "" {
 		args = append(args, "--label", extraLabel)
 	}
-	args = append(args, image, "sleep", "infinity")
+	args = append(args, spec.Image, "sleep", "infinity")
 	return args, nil
 }
 
-func containerExecArgs(name, user string, argv []string) []string {
+func containerExecArgs(name, user, workdir string, env, argv []string) []string {
 	args := []string{
 		"exec",
 		"--user", user,
-		"-e", "HOME=/tmp",
-		"-e", "PYTHONDONTWRITEBYTECODE=1",
-		"-e", "PYTHONUNBUFFERED=1",
-		"-e", "PYTHONPATH=/workspace",
-		"-w", "/workspace",
-		name,
 	}
+	for _, item := range env {
+		args = append(args, "-e", item)
+	}
+	args = append(args, "-w", workdir, name)
 	return append(args, argv...)
 }
 

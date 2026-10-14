@@ -111,6 +111,56 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 			return Result{}, err
 		}
 		return allowed(tool, body, "workspace write inside the run worktree"), nil
+	case "write_file":
+		var write tools.WriteArgs
+		if err := decode(raw, &write); err != nil {
+			return denied(tool, raw, "invalid arguments"), nil
+		}
+		rel, err := tools.SafeRel(write.Path)
+		if err != nil {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, "secret paths are not available to the agent"), nil
+		}
+		if strings.Contains(write.Content, "\x00") || len(write.Content) > 200_000 {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, "content must be text under 200KB"), nil
+		}
+		if !shaOK(write.BeforeSHA256, false) {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, "before_sha256 must be empty or 64 lowercase hex characters"), nil
+		}
+		body, err := json.Marshal(write)
+		if err != nil {
+			return Result{}, err
+		}
+		return allowed(tool, body, "workspace write inside the run worktree"), nil
+	case "delete_file":
+		var del tools.DeleteArgs
+		if err := decode(raw, &del); err != nil {
+			return denied(tool, raw, "invalid arguments"), nil
+		}
+		rel, err := tools.SafeRel(del.Path)
+		if err != nil {
+			body, _ := json.Marshal(del)
+			return denied(tool, body, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			body, _ := json.Marshal(del)
+			return denied(tool, body, "secret paths are not available to the agent"), nil
+		}
+		if !shaOK(del.BeforeSHA256, true) {
+			body, _ := json.Marshal(del)
+			return denied(tool, body, "before_sha256 must be 64 lowercase hex characters"), nil
+		}
+		body, err := json.Marshal(del)
+		if err != nil {
+			return Result{}, err
+		}
+		return allowed(tool, body, "workspace delete inside the run worktree"), nil
 	case "git_push":
 		var args tools.PushArgs
 		if err := decode(raw, &args); err != nil {
@@ -142,6 +192,21 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 	default:
 		return denied(tool, raw, "unknown tool"), nil
 	}
+}
+
+func shaOK(s string, required bool) bool {
+	if s == "" {
+		return !required
+	}
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func token(s string) bool {

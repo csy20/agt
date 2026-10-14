@@ -6,12 +6,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/csy20/agt/internal/profile"
 )
 
 func TestPreflightReportsMissingImage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	err := preflight(ctx, "agt-sandbox:does-not-exist")
+	err := (&Runner{Images: profile.Images{Python: "agt-sandbox:does-not-exist"}}).Preflight(ctx)
 	if err == nil {
 		t.Fatal("expected an error")
 	}

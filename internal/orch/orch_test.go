@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/csy20/agt/internal/orch"
+	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/testutil"
@@ -256,6 +257,138 @@ func TestResumeDoesNotDoubleApplyPatch(t *testing.T) {
 		t.Fatalf("apply_patch commands %d", patches)
 	}
 	assertNoContainer(t, created.ID)
+}
+
+func TestGoAndJavaScriptProfilesRepairDistinctFailures(t *testing.T) {
+	cases := []struct {
+		name    string
+		req     profile.Request
+		file    string
+		needle  string
+		script  string
+		timeout time.Duration
+	}{
+		{
+			name:    "gocounter",
+			req:     profile.Request{Name: profile.NameGo, Argv: []string{"go", "test", "./..."}, Memory: "512m", TimeoutSec: 180, PIDs: 128},
+			file:    "counter.go",
+			needle:  "n + 1",
+			script:  "fix_gocounter.json",
+			timeout: 4 * time.Minute,
+		},
+		{
+			name:    "jsquote",
+			req:     profile.Request{Name: profile.NameJavaScript, Argv: []string{"node", "--test"}},
+			file:    "quote.js",
+			needle:  ".replace(",
+			script:  "fix_jsquote.json",
+			timeout: 2 * time.Minute,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testutil.Open(t)
+			eng := testutil.NewEngine(t, st, orch.Hooks{})
+			fixture := filepath.Join(testutil.RepoRoot(t), "eval", "fixtures", tc.name)
+			original, err := os.ReadFile(filepath.Join(fixture, tc.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(original), tc.needle) {
+				t.Fatalf("fixture already contains %q", tc.needle)
+			}
+			script, err := os.ReadFile(filepath.Join(testutil.RepoRoot(t), "eval", "scripts", tc.script))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(script), tc.needle) && strings.Contains(string(original), tc.needle) {
+				t.Fatal("fix is embedded in the fixture")
+			}
+			prof := eng.MustProfile(t, tc.req)
+			if prof.Name != tc.req.Name || prof.Network != "none" || len(prof.Prepare) != 0 {
+				t.Fatalf("profile %+v", prof.Identity())
+			}
+			created := eng.CreateWithProfile(t, "repair the failing test", fixture, 100, 16, script, prof)
+			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
+			defer cancel()
+			if err := eng.Orch.Run(ctx, created.ID); err != nil {
+				testutil.Dump(t, st, created.ID)
+				t.Fatal(err)
+			}
+			current, err := st.GetRun(context.Background(), created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.State != run.Succeeded {
+				testutil.Dump(t, st, created.ID)
+				t.Fatalf("state %s err %s", current.State, current.Error)
+			}
+			stored, err := profile.Parse(current.ProfileJSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Name != tc.req.Name || strings.Join(stored.Argv, " ") != strings.Join(tc.req.Argv, " ") {
+				t.Fatalf("stored profile %+v", stored.Identity())
+			}
+			patched, err := os.ReadFile(filepath.Join(current.Worktree, tc.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(patched), tc.needle) {
+				t.Fatalf("worktree missing %q\n%s", tc.needle, patched)
+			}
+			after, err := os.ReadFile(filepath.Join(fixture, tc.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(original) {
+				t.Fatal("source fixture was modified")
+			}
+			var result struct {
+				Diff  string `json:"diff"`
+				Tests struct {
+					Passed bool `json:"passed"`
+				} `json:"tests"`
+			}
+			if err := json.Unmarshal(current.Result, &result); err != nil {
+				t.Fatal(err)
+			}
+			if !result.Tests.Passed || !strings.Contains(result.Diff, tc.needle) {
+				testutil.Dump(t, st, created.ID)
+				t.Fatalf("verify passed=%v diff=%s", result.Tests.Passed, result.Diff)
+			}
+			if !sawFailingTest(t, st, created.ID) {
+				t.Fatal("the profile command did not fail before the repair")
+			}
+			if eng.Runner != nil && eng.Runner.ExecCount() == 0 {
+				t.Fatal("sandbox runner was configured but did not execute")
+			}
+			assertNoContainer(t, created.ID)
+		})
+	}
+}
+
+func sawFailingTest(t *testing.T, st *store.Store, runID string) bool {
+	t.Helper()
+	cmds, err := st.ListCommands(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range cmds {
+		if cmd.Tool != "run_test" || len(cmd.Result) == 0 {
+			continue
+		}
+		var result struct {
+			Exit int `json:"exit_code"`
+		}
+		if err := json.Unmarshal(cmd.Result, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Exit != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func readProcessor(t *testing.T, root string) []byte {

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/csy20/agt/internal/profile"
 )
 
 func TestContainerRunMountsOnlyTheWorktree(t *testing.T) {
@@ -14,7 +16,16 @@ func TestContainerRunMountsOnlyTheWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	args, err := containerRunArgs("agt-sandbox:local", "agt-run", work, "run_1", "1000:1000", "")
+	spec := ExecSpec{
+		Image:   "agt-sandbox:local",
+		Argv:    []string{"python", "-m", "unittest"},
+		Env:     profile.EnvFor(profile.NamePython),
+		Workdir: "/workspace",
+		Memory:  "256m",
+		CPUs:    "1",
+		PIDs:    64,
+	}
+	args, err := containerRunArgs(spec, "agt-run", work, "run_1", "1000:1000", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,6 +46,7 @@ func TestContainerRunMountsOnlyTheWorktree(t *testing.T) {
 		}
 	}
 	assertFlag(t, args, "--network", "none")
+	assertFlag(t, args, "--tmpfs", "/tmp:rw,exec,nosuid,size=128m")
 	assertFlag(t, args, "--cap-drop", "ALL")
 	assertFlag(t, args, "--security-opt", "no-new-privileges")
 	assertFlag(t, args, "--memory", "256m")
@@ -45,13 +57,21 @@ func TestContainerRunMountsOnlyTheWorktree(t *testing.T) {
 		t.Fatal("missing --read-only")
 	}
 	envs := flagValues(args, "-e")
-	if strings.Join(envs, ",") != "HOME=/tmp,PYTHONDONTWRITEBYTECODE=1" {
+	if strings.Join(envs, ",") != strings.Join(profile.EnvFor(profile.NamePython), ",") {
 		t.Fatalf("run env %q", envs)
 	}
-	execArgs := containerExecArgs("agt-run", "1000:1000", []string{"python", "-m", "unittest"})
+	for _, banned := range []string{"AGT_", "AWS_", "DATABASE_URL"} {
+		if strings.Contains(strings.Join(envs, "\n"), banned) {
+			t.Fatalf("env contains %s", banned)
+		}
+	}
+	execArgs := containerExecArgs("agt-run", "1000:1000", spec.Workdir, spec.Env, spec.Argv)
 	execEnv := flagValues(execArgs, "-e")
-	if strings.Join(execEnv, ",") != "HOME=/tmp,PYTHONDONTWRITEBYTECODE=1,PYTHONUNBUFFERED=1,PYTHONPATH=/workspace" {
+	if strings.Join(execEnv, ",") != strings.Join(spec.Env, ",") {
 		t.Fatalf("exec env %q", execEnv)
+	}
+	if flagValues(execArgs, "-w")[0] != "/workspace" {
+		t.Fatalf("workdir %q", flagValues(execArgs, "-w"))
 	}
 }
 

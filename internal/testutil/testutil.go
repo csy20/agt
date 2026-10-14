@@ -13,6 +13,7 @@ import (
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/model"
 	"github.com/csy20/agt/internal/orch"
+	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/sandbox"
 	"github.com/csy20/agt/internal/store"
@@ -119,21 +120,15 @@ type Engine struct {
 	created int
 	runIDs  []string
 	dirs    []*workspace.Dir
-	image   string
+	images  profile.Images
 }
 
 func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 	t.Helper()
-	eng := &Engine{Store: st, DataDir: t.TempDir(), image: "host"}
-	if image := os.Getenv("AGT_SANDBOX_IMAGE"); image != "" {
-		if _, err := exec.LookPath("docker"); err != nil {
-			t.Fatalf("AGT_SANDBOX_IMAGE is set and docker is absent: %v", err)
-		}
-		if err := exec.Command("docker", "image", "inspect", image).Run(); err != nil {
-			t.Fatalf("sandbox image %s is not available: %v", image, err)
-		}
-		eng.image = image
-		eng.Runner = &sandbox.Runner{Image: image}
+	images := TestImages(t)
+	eng := &Engine{Store: st, DataDir: t.TempDir(), images: images}
+	if len(images.List()) > 0 {
+		eng.Runner = &sandbox.Runner{Images: images}
 	}
 	eng.Orch = orch.New(orch.Options{
 		Store:   st,
@@ -155,11 +150,15 @@ func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 			eng.created++
 			eng.runIDs = append(eng.runIDs, current.ID)
 			eng.mu.Unlock()
+			prof, err := profile.Parse(current.ProfileJSON)
+			if err != nil {
+				return nil, err
+			}
 			dir := workspace.NewDir(current.Worktree, orch.BasePath(current.Worktree), func(ctx context.Context, root string) (string, string, int, error) {
 				if eng.Runner != nil {
-					return eng.Runner.RunTest(ctx, root, current.ID)
+					return eng.Runner.RunProfile(ctx, root, current.ID, prof)
 				}
-				return workspace.HostPython(ctx, root)
+				return workspace.HostExec(ctx, root, prof)
 			})
 			if eng.Runner != nil {
 				dir.CloseFn = func(ctx context.Context) error {
@@ -186,23 +185,82 @@ func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 	return eng
 }
 
+// PayrepoRequest is the explicit Python command for the retry fixture.
+// It lives in the test helper. Production does not assume this argv.
+func PayrepoRequest() profile.Request {
+	return profile.Request{
+		Name: profile.NamePython,
+		Argv: []string{"python", "-m", "unittest", "tests.test_retry"},
+	}
+}
+
 func (e *Engine) Create(t *testing.T, goal, repo string, budget, maxSteps int, script []byte) store.Run {
 	t.Helper()
+	return e.CreateWithProfile(t, goal, repo, budget, maxSteps, script, e.MustProfile(t, PayrepoRequest()))
+}
+
+func (e *Engine) CreateWithProfile(t *testing.T, goal, repo string, budget, maxSteps int, script []byte, prof profile.Profile) store.Run {
+	t.Helper()
+	raw, err := prof.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
 	created, _, err := e.Store.CreateRun(context.Background(), store.CreateInput{
 		Goal:         goal,
 		RepoPath:     repo,
 		BudgetCents:  budget,
 		MaxSteps:     maxSteps,
 		WallSeconds:  300,
-		AgentVersion: version.Compute(e.image),
+		AgentVersion: version.Compute(e.images.Python, e.images.Go, e.images.Node),
 		Provider:     "fake",
 		RequestHash:  id.New("req_"),
 		ScriptJSON:   script,
+		ProfileJSON:  raw,
 	})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 	return created
+}
+
+func (e *Engine) MustProfile(t *testing.T, req profile.Request) profile.Profile {
+	t.Helper()
+	images := e.images
+	if len(images.List()) == 0 {
+		images = profile.Images{Python: "host", Go: "host", Node: "host"}
+	}
+	prof, err := profile.Resolve(req, images, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prof
+}
+
+// TestImages reads the sandbox tags. When any tag is set, all three must be
+// set and present. An unset group uses the host runner and is not container support.
+func TestImages(t *testing.T) profile.Images {
+	t.Helper()
+	python := os.Getenv("AGT_IMAGE_PYTHON")
+	if python == "" {
+		python = os.Getenv("AGT_SANDBOX_IMAGE")
+	}
+	goImage := os.Getenv("AGT_IMAGE_GO")
+	node := os.Getenv("AGT_IMAGE_NODE")
+	if python == "" && goImage == "" && node == "" {
+		return profile.Images{}
+	}
+	if python == "" || goImage == "" || node == "" {
+		t.Fatal("set AGT_IMAGE_PYTHON or AGT_SANDBOX_IMAGE, AGT_IMAGE_GO, and AGT_IMAGE_NODE together")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Fatalf("sandbox images are set and docker is absent: %v", err)
+	}
+	for _, image := range []string{python, goImage, node} {
+		if err := exec.Command("docker", "image", "inspect", image).Run(); err != nil {
+			t.Fatalf("sandbox image %s is not available: %v", image, err)
+		}
+	}
+	return profile.Images{Python: python, Go: goImage, Node: node}
 }
 
 func (e *Engine) Created() int {

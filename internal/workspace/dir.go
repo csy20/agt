@@ -2,12 +2,10 @@ package workspace
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,6 +23,8 @@ type Handle interface {
 	Read(ctx context.Context, path string, start, end int) (string, int, error)
 	Diff(ctx context.Context) (string, int, error)
 	Patch(ctx context.Context, path, old, new string) (string, int, error)
+	Write(ctx context.Context, args tools.WriteArgs) (string, int, error)
+	Delete(ctx context.Context, args tools.DeleteArgs) (string, int, error)
 	Test(ctx context.Context) (string, int, error)
 	Calls() []string
 	Close(ctx context.Context) error
@@ -92,6 +92,30 @@ func (d *Dir) Patch(_ context.Context, path, old, new string) (string, int, erro
 	out, err := tools.Patch(d.Work, path, old, new)
 	if err != nil {
 		return err.Error(), 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Write(_ context.Context, args tools.WriteArgs) (string, int, error) {
+	d.note("write_file")
+	out, err := tools.WriteFile(d.Work, args)
+	if err != nil {
+		if out == "" {
+			out = err.Error()
+		}
+		return out, 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Delete(_ context.Context, args tools.DeleteArgs) (string, int, error) {
+	d.note("delete_file")
+	out, err := tools.DeleteFile(d.Work, args)
+	if err != nil {
+		if out == "" {
+			out = err.Error()
+		}
+		return out, 2, nil
 	}
 	return out, 0, nil
 }
@@ -202,34 +226,4 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	return os.Chmod(dst, perm)
-}
-
-// HostPython runs the fixture unittest on the host. The server does not use it.
-func HostPython(ctx context.Context, root string) (string, string, int, error) {
-	cmd := exec.CommandContext(ctx, "python3", "-m", "unittest", "tests.test_retry")
-	cmd.Dir = root
-	cmd.Env = hostPythonEnv(root)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err == nil {
-		return stdout.String(), stderr.String(), 0, nil
-	}
-	var exit *exec.ExitError
-	if errors.As(err, &exit) {
-		return stdout.String(), stderr.String(), exit.ExitCode(), nil
-	}
-	return stdout.String(), stderr.String(), 0, err
-}
-
-func hostPythonEnv(root string) []string {
-	env := make([]string, 0, 16)
-	for _, item := range os.Environ() {
-		if strings.HasPrefix(item, "PYTHONPATH=") || strings.HasPrefix(item, "PYTHONDONTWRITEBYTECODE=") {
-			continue
-		}
-		env = append(env, item)
-	}
-	return append(env, "PYTHONDONTWRITEBYTECODE=1", "PYTHONPATH="+root)
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/csy20/agt/internal/diag"
 	"github.com/csy20/agt/internal/model"
 	"github.com/csy20/agt/internal/orch"
+	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/sandbox"
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/telemetry"
@@ -64,7 +65,7 @@ func run() int {
 		slog.Warn(msg)
 	}
 	// Tests run only in this Docker runner. There is no host-process fallback.
-	runner := &sandbox.Runner{Image: cfg.SandboxImage}
+	runner := &sandbox.Runner{Images: cfg.ProfileImages()}
 	checkCtx, cancelCheck := context.WithTimeout(ctx, 20*time.Second)
 	err = runner.Preflight(checkCtx)
 	cancelCheck()
@@ -95,8 +96,12 @@ func run() int {
 			}
 		},
 		NewWorkspace: func(current store.Run) (workspace.Handle, error) {
+			prof, err := profile.Parse(current.ProfileJSON)
+			if err != nil {
+				return nil, err
+			}
 			dir := workspace.NewDir(current.Worktree, orch.BasePath(current.Worktree), func(ctx context.Context, root string) (string, string, int, error) {
-				return runner.RunTest(ctx, root, current.ID)
+				return runner.RunProfile(ctx, root, current.ID, prof)
 			})
 			dir.CloseFn = func(ctx context.Context) error {
 				return runner.Destroy(ctx, current.ID)

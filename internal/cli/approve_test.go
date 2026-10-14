@@ -122,7 +122,9 @@ func TestFixSendsAbsolutePathsFromAnotherDirectory(t *testing.T) {
 	t.Setenv("AGT_TOKEN", "test-token-value1")
 	code := Run([]string{
 		"agt", "fix", "--server", ts.URL, "--provider", "fake", "--script", scriptRel,
-		"--repo", repoRel, "make the retry test pass",
+		"--repo", repoRel, "--profile", "python",
+		"--test-arg", "python", "--test-arg", "-m", "--test-arg", "unittest", "--test-arg", "tests.test_retry",
+		"make the retry test pass",
 	})
 	if code == 2 {
 		t.Fatal("fix rejected the documented arguments")
@@ -172,7 +174,7 @@ func TestFixDoesNotSubstituteSampleScript(t *testing.T) {
 
 	t.Setenv("AGT_PROVIDER", "")
 	chdir(t, root)
-	code := Run([]string{"agt", "fix", "--server", ts.URL, "--provider", "fake", "--repo", repo, "fix an unrelated bug"})
+	code := Run([]string{"agt", "fix", "--server", ts.URL, "--provider", "fake", "--repo", repo, "--profile", "python", "--test-arg", "python", "fix an unrelated bug"})
 	if code != 2 {
 		t.Fatalf("exit %d, want 2", code)
 	}
@@ -212,7 +214,7 @@ func TestProviderFlagRespectsEnvironment(t *testing.T) {
 
 	t.Setenv("AGT_PROVIDER", "openai")
 	t.Setenv("AGT_TOKEN", "test-token-value1")
-	code := Run([]string{"agt", "fix", "--server", ts.URL, "--repo", repo, "repair the test"})
+	code := Run([]string{"agt", "fix", "--server", ts.URL, "--repo", repo, "--profile", "python", "--test-arg", "python", "repair the test"})
 	if code == 2 {
 		t.Fatal("AGT_PROVIDER=openai was rejected")
 	}

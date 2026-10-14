@@ -12,6 +12,7 @@ import (
 
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/model"
+	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/sandbox"
 	"github.com/csy20/agt/internal/testutil"
 	"github.com/csy20/agt/internal/tools"
@@ -22,7 +23,10 @@ func TestSandboxRunsTestsAndStaysClosed(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker absent")
 	}
-	image := os.Getenv("AGT_SANDBOX_IMAGE")
+	image := os.Getenv("AGT_IMAGE_PYTHON")
+	if image == "" {
+		image = os.Getenv("AGT_SANDBOX_IMAGE")
+	}
 	if image == "" {
 		t.Skip("AGT_SANDBOX_IMAGE unset")
 	}
@@ -40,14 +44,21 @@ func TestSandboxRunsTestsAndStaysClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := &sandbox.Runner{Image: image, ExtraLabel: "agt-test=sandbox"}
+	runner := &sandbox.Runner{Images: profile.Images{Python: image}, ExtraLabel: "agt-test=sandbox"}
+	py, err := profile.Resolve(profile.Request{
+		Name: profile.NamePython,
+		Argv: []string{"python", "-m", "unittest", "tests.test_retry"},
+	}, profile.Images{Python: image}, "amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_ = runner.Destroy(context.Background(), runID)
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	stdout, stderr, code, err := runner.RunTest(ctx, work, runID)
+	stdout, stderr, code, err := runner.RunProfile(ctx, work, runID, py)
 	if err != nil {
 		t.Fatalf("first test: %v\n%s\n%s", err, stdout, stderr)
 	}
@@ -60,7 +71,7 @@ func TestSandboxRunsTestsAndStaysClosed(t *testing.T) {
 	if err != nil || msg != "patched" {
 		t.Fatalf("patch %q %v", msg, err)
 	}
-	stdout, stderr, code, err = runner.RunTest(ctx, work, runID)
+	stdout, stderr, code, err = runner.RunProfile(ctx, work, runID, py)
 	if err != nil {
 		t.Fatalf("second test: %v\n%s\n%s", err, stdout, stderr)
 	}
@@ -76,7 +87,7 @@ func TestSandboxRunsTestsAndStaysClosed(t *testing.T) {
 	}
 
 	t.Setenv("AGT_HOST_SENTINEL", "host-secret")
-	stdout, stderr, code, err = runner.Exec(ctx, work, runID, []string{"python", "-c", `
+	stdout, stderr, code, err = runner.Exec(ctx, work, runID, probeSpec(image, `
 import os, socket
 s = socket.socket()
 s.settimeout(2)
@@ -86,7 +97,7 @@ try:
 except Exception:
     print("NETWORK_CLOSED")
 print("SENTINEL=[" + os.environ.get("AGT_HOST_SENTINEL", "") + "]")
-`})
+`))
 	if err != nil || code != 0 {
 		t.Fatalf("probe exit %d err %v\n%s\n%s", code, err, stdout, stderr)
 	}
@@ -99,10 +110,10 @@ print("SENTINEL=[" + os.environ.get("AGT_HOST_SENTINEL", "") + "]")
 
 	sibling := filepath.Join(filepath.Dir(work), "escape-sibling")
 	marker := filepath.Join(t.TempDir(), "host-marker")
-	_, _, _, _ = runner.Exec(ctx, work, runID, []string{"python", "-c", `
+	_, _, _, _ = runner.Exec(ctx, work, runID, probeSpec(image, `
 open("/workspace/../escape-sibling", "w").write("nope")
-open(` + quote(marker) + `, "w").write("nope")
-`})
+open(`+quote(marker)+`, "w").write("nope")
+`))
 	if _, err := os.Stat(sibling); !os.IsNotExist(err) {
 		t.Fatalf("write escaped to %s (%v)", sibling, err)
 	}
@@ -110,11 +121,11 @@ open(` + quote(marker) + `, "w").write("nope")
 		t.Fatalf("write escaped to %s (%v)", marker, err)
 	}
 
-	stdout, stderr, code, err = runner.Exec(ctx, work, runID, []string{"python", "-c", `
+	stdout, stderr, code, err = runner.Exec(ctx, work, runID, probeSpec(image, `
 import os
 open("/workspace/agt-write-probe", "w").write("ok\n")
 print("UID", os.getuid())
-`})
+`))
 	if err != nil || code != 0 {
 		t.Fatalf("write probe exit %d err %v\n%s\n%s", code, err, stdout, stderr)
 	}
@@ -178,6 +189,18 @@ func patchArgs(t *testing.T) (string, string, string) {
 	}
 	t.Fatal("script has no apply_patch step")
 	return "", "", ""
+}
+
+func probeSpec(image, program string) sandbox.ExecSpec {
+	return sandbox.ExecSpec{
+		Image:   image,
+		Argv:    []string{"python", "-c", program},
+		Env:     profile.EnvFor(profile.NamePython),
+		Workdir: "/workspace",
+		Memory:  "256m",
+		CPUs:    "1",
+		PIDs:    64,
+	}
 }
 
 func quote(path string) string {
