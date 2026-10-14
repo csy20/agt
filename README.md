@@ -20,11 +20,16 @@ With Postgres and `agtd` already running:
 
 `--profile` is required. `--repo` does not choose a language or a test command. `agt profile detect --repo PATH` prints a suggestion and does not start a run. The same flags work for the Go fixture (`--profile go --test-arg go --test-arg test --test-arg ./...`, repo `eval/fixtures/gocounter`) and the JavaScript fixture (`--profile javascript --test-arg node --test-arg --test`, repo `eval/fixtures/jsquote`). `typescript` is an alias of the JavaScript profile. These profiles do not install dependencies: the network stays disabled and the image already contains the toolchain.
 
-Reattach after the client exits:
+Reattach after the client exits. Leaving `attach` does not cancel the run and does not apply the change:
 
 ```sh
 ./bin/agt run attach RUN_ID
+./bin/agt run diff RUN_ID
+./bin/agt run export RUN_ID --output patch.json
+./bin/agt run apply RUN_ID --digest DIGEST
 ```
+
+`agt run apply` without `--digest` prints the diff, the file operations, and the digest, then exits 2. The daemon rebuilds the patch from the run snapshot and writes only the repository stored for that run. The source tree stays unchanged until that command is authorized. A stale file, or a digest that does not match, writes nothing.
 
 Approve one command, not the conversation. Flags may follow the ids:
 
@@ -36,7 +41,7 @@ Approve one command, not the conversation. Flags may follow the ids:
 
 The client converts repository and script paths to absolute paths before sending them, so the daemon's working directory does not choose the repository.
 
-The copied workspace keeps executable bits and project files such as `.github` and `.gitignore`. It skips `.git`, `node_modules`, `vendor`, and common build directories (`build`, `dist`, `target`, and similar). It also skips secret names such as `.env`, private keys, and the directories `.ssh`, `.aws`, `.gnupg`, `.kube`, and `.docker`. `.env.example`, `.env.sample`, and `.env.template` are copied. A file over 8 MiB fails the copy. Symlinks are refused. Paths that leave the worktree, including `..`, absolute paths, drive letters, and UNC paths, are rejected. A path containing `:` is rejected so a Windows alternate data stream cannot be addressed.
+The run keeps a filesystem snapshot of the working tree, including uncommitted files, under the data directory. It does not create a Git worktree, and `COMMITTING` does not create a Git commit. The machine-applicable record is a `patch.v1` artifact with exact bytes and modes. The diff printed in the terminal is a preview and can be shorter than that artifact. The copied workspace keeps executable bits and project files such as `.github` and `.gitignore`. It skips `.git`, `node_modules`, `vendor`, and common build directories (`build`, `dist`, `target`, and similar). A repository nested inside the data directory, or a data directory nested inside the repository, is rejected. It also skips secret names such as `.env`, private keys, and the directories `.ssh`, `.aws`, `.gnupg`, `.kube`, and `.docker`. `.env.example`, `.env.sample`, and `.env.template` are copied. A file over 8 MiB fails the copy. Symlinks are refused. Paths that leave the worktree, including `..`, absolute paths, drive letters, and UNC paths, are rejected. A path containing `:` is rejected so a Windows alternate data stream cannot be addressed.
 
 Unix hosts pass the host uid and gid to Docker. Native Windows uses the unprivileged image user `65532:65532`. The daemon does not pass `-1:-1`, and it does not run tests on the host when Docker is missing. The test container mounts only that run's workspace at `/workspace`. It does not mount the home directory, SSH or cloud credential directories, or the Docker socket, and it does not receive the host environment. The client sends a profile name and an argv. The daemon chooses the image. A request that includes an image is rejected. Python, Go, and JavaScript use `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node` unless `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, or `AGT_IMAGE_NODE` is set. `AGT_SANDBOX_IMAGE` is the Python image. Startup fails if a configured image is missing. `/tmp` in the container is executable because `go test` writes and runs its test binary there. The root filesystem stays read-only, and `/tmp` stays `nosuid`.
 

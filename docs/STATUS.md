@@ -1,6 +1,6 @@
 # AGT status
 
-Updated 14 October 2026 on branch `milestone-4-repair`, based on `milestone-3-profiles` at `a62f1e6c22675b8c3bbb46e14deccb8193bef176`.
+Updated 14 October 2026 on branch `milestone-5-review`, based on `milestone-4-repair` at `7448990`.
 This file records what the code and the checks actually show. A passing fake-provider demo is not a live-model repair. A cross-compile is not native execution. A skipped integration test is not support.
 
 ## Milestone 1
@@ -64,13 +64,26 @@ Implemented on this branch. The model proposes one action. The supervisor decide
 
 `TestLoopbackAdapterRepairsPayrepo` is a local `httptest` server on `127.0.0.1` that speaks chat completions over SSE. It drove the payrepo retry fixture through a plan, a failing test, a docstring-only patch, a failed verification, the idempotent charge patch, and a passing verification. The source fixture was unchanged, the result outcome was `repaired`, and the model name was `local-repair`. That server is not OpenAI's hosted API. A hosted smoke was not run because it was not opted in. No API key was printed. The fake-provider scripts remain labelled demos.
 
+## Milestone 5
+
+Implemented on this branch. The workspace is a filesystem snapshot plus a `patch.v1` artifact. It is not a Git worktree. `COMMITTING` is still not a Git commit. The supervisor does not apply the artifact to the source repository.
+
+| Control | Where | Check |
+|---|---|---|
+| `Materialize` copies the working tree, including uncommitted files, into `dataDir/runs/<id>/{work,base}`. It does not modify the source. `.git` is not copied. A data directory inside the repository, or a repository inside the data directory, is rejected before the copy. `ReadCapture` reads `HEAD`, a ref file, or `packed-refs` and does not run Git. A repository without `.git` has an empty revision and still copies. The run records `workspace.captured` with strategy `snapshot-plus-patch` | `internal/workspace`, `internal/orch/orch.go` | `TestMaterializeRejectsNestedDataAndRepo`, `TestMaterializeCopiesUncommittedFilesAndReadsHEAD`, `TestReviewedApplyUpdatesACopyAndRejectsAStalePatch` |
+| Contract `patch.v1`. Files are `add`, `modify`, or `delete`, with octal modes, before and after SHA-256, and exact after-bytes in `content_base64`. Line endings are not normalized. The digest covers the contract, run id, recorded repository path, base-tree digest, and those file records. The Git revision is stored and is not part of the digest. The unified diff remains a preview: `tools.Diff` still stops above 1 MiB or 2500 lines. The artifact does not. Each copied file is still limited to 8 MiB. The CLI refuses an export larger than 64 MiB | `internal/patch`, `internal/tools/diff.go`, `internal/cli/review.go` | `TestBuildKeepsExactBytesModesAndDeletes`, `TestApplyKeepsModeOnlyChanges` |
+| `GET /v1/runs/{id}/diff` and `GET /v1/runs/{id}/patch` work once the snapshot exists. `POST /v1/runs/{id}/apply` accepts only `{"digest":"..."}`. Another field, including `repo_path`, is rejected. Apply requires `SUCCEEDED`. The daemon rebuilds the artifact from the snapshot and writes only the repository stored on the run. A digest mismatch or a touched file whose bytes or mode differ from the snapshot writes nothing. Untouched dirty files stay. Bytes are staged with a temporary file and rename. A rollback directory and manifest are written first. A failure after a write restores the files this apply changed. `apply.lock` is exclusive; an interrupted apply can leave it, and the next apply then refuses until that file is removed | `internal/api/review.go`, `internal/patch/apply.go` | `TestReviewedApplyIsDigestBound`, `TestApplyPreservesDirtyFilesAndRejectsStaleOrEscape`, `TestApplyRollsBackAPartialWrite` |
+| `agt run diff` prints the preview and the digest. `agt run export --output FILE` creates a mode `0600` file and does not replace an existing one. `agt run apply` without `--digest` prints the preview, the operations, and the digest, then exits 2. With `--digest` it posts that digest and does not upload file bytes | `internal/cli` | `TestRunReviewShowsTheArtifactBeforeApply` |
+
+`TestReviewedApplyUpdatesACopyAndRejectsAStalePatch` repaired a copy of `eval/fixtures/payrepo` with the fake provider and `agt-sandbox:python`. The copy and the fixture stayed unchanged until `patch.Apply`. The apply wrote the charge fix. A later edit to that file made a second apply return a conflict and left the newer bytes in place. `eval/fixtures` was not modified. An approved test-file edit followed by passing verification was still not integration-tested.
+
 ## Checks run on this machine
 
 Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 via `deploy/compose.yaml` on `127.0.0.1:54329`.
 
-- `make test` passed on this branch. It builds `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`, exports those tags, and runs `go test ./...`. `internal/api` passed in about 7 seconds, `internal/store` in about 22 seconds, `internal/orch` in about 74 seconds, and `internal/sandbox` in about 4 seconds. The orchestrator package included the repair-loop tests and `TestLoopbackAdapterRepairsPayrepo` against the Python image. `TestGoAndJavaScriptProfilesRepairDistinctFailures` ran `go test ./...` in `agt-sandbox:go` and `node --test` in `agt-sandbox:node`. The source fixtures were unchanged.
-- `make demo` was not re-run on this branch. The Milestone 3 demo still applies to the fake-provider path: it exited 0 with `AGT_DATA_DIR=/tmp/agt-demo`, token mode `600`, directory mode `700`, `--profile python`, and run id `run_0c3fc8d8e0165c95`. That demo is not the loopback adapter test.
-- `CGO_ENABLED=0` `go test -c` for `windows/amd64`, `darwin/amd64`, `darwin/arm64`, and `linux/arm64` succeeded for `cmd/agtd`, `internal/api`, `internal/model`, `internal/orch`, `internal/policy`, `internal/store`, `internal/tools`, `internal/workspace`, `internal/diag`, and `internal/run`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The scratch binaries were deleted. `internal/auth` was not cross-compiled on this branch. The Linux amd64 binaries used by `make test` were executed.
+- `go test ./...` passed with `AGT_DATABASE_URL` set and `AGT_IMAGE_PYTHON`, `AGT_IMAGE_GO`, and `AGT_IMAGE_NODE` set to the existing tags `agt-sandbox:python`, `agt-sandbox:go`, and `agt-sandbox:node`. This run did not rebuild those images. `internal/api` passed in about 18 seconds, `internal/store` in about 20 seconds, `internal/orch` in about 75 seconds, and `internal/sandbox` in about 5 seconds. The orchestrator package included the repair-loop tests, `TestLoopbackAdapterRepairsPayrepo`, and `TestReviewedApplyUpdatesACopyAndRejectsAStalePatch`. The source fixtures were unchanged.
+- `make test` and `make demo` were not re-run on this branch. The Milestone 3 demo still applies to the fake-provider path: it exited 0 with `AGT_DATA_DIR=/tmp/agt-demo`, token mode `600`, directory mode `700`, `--profile python`, and run id `run_0c3fc8d8e0165c95`. That demo is not the loopback adapter test.
+- `CGO_ENABLED=0` `go test -c` for `windows/amd64`, `darwin/amd64`, `darwin/arm64`, and `linux/arm64` succeeded for `internal/api`, `internal/cli`, `internal/orch`, `internal/patch`, and `internal/workspace`. `go build` succeeded for `cmd/agt` and `cmd/agtd` on those four targets. None of those binaries were executed. The scratch binaries were deleted. `internal/auth` was not cross-compiled on this branch. The Linux amd64 binaries used by `go test` were executed.
 
 `internal/testutil.Open` still skips when Postgres is unreachable and `AGT_DATABASE_URL` is unset. That skip is not evidence of database support. `make test` sets the URL and fails if Postgres is down. A `go test` that does not export the three image variables may use the host runner. Do not record that run as container support.
 
@@ -78,8 +91,8 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 
 | Area | State | Evidence |
 |---|---|---|
-| CLI fix / run / approve / version | Partial | Commands above work and send the local token. `fix` and `run create` require `--profile`. `profile detect` only suggests. No run list, cancel, pause, resume, diff export, or local apply |
-| Daemon and API | Partial | Health is open. Other routes require the local token. Listen is loopback-only. Postgres required. Create rejects a missing profile and a client-supplied image |
+| CLI fix / run / approve / version | Partial | Commands above work and send the local token. `fix` and `run create` require `--profile`. `profile detect` only suggests. `run diff`, `run export`, and `run apply` review or write the recorded repository. No run list, cancel, pause, or resume |
+| Daemon and API | Partial | Health is open. Other routes require the local token. Listen is loopback-only. Postgres required. Create rejects a missing profile, a client-supplied image, and a repository nested with the data directory. Diff, patch, and apply are local and digest-bound |
 | Run lifecycle | Partial | States and compare-and-swap exist. `COMMITTING` is not a Git commit. Several states have no user workflow |
 | Persistence | Partial | `001_init.sql`, `002_profile.sql` (`profile_json`), and `003_transcript.sql` (`model_messages`). Job leases are still 30 seconds and are not renewed |
 | Agent loop | Partial | A failing verification can return to the model while budget remains. `TestLoopbackAdapterRepairsPayrepo` repaired payrepo through a local OpenAI-compatible server. Fake-provider fixtures remain demos. No hosted-model run |
@@ -88,23 +101,23 @@ Host: Linux amd64. Go 1.23.5 (`GOTOOLCHAIN=local`). Docker 29.8.1. Postgres 16 v
 | Isolation | Partial on Linux | Three per-language images, one workspace mount, no network, dropped capabilities, resource limits from the profile, filtered docker CLI environment, host uid on Linux. `/tmp` is executable and `nosuid`. Windows user id is selected in code and was not run |
 | Model adapter | Partial | OpenAI-compatible chat completions, one streamed tool call, a single capability fallback, and retries for 429 and 5xx. A loopback base URL may omit the API key. A cloud URL requires it. More than one tool call is rejected. A hosted model was not called |
 | Accounting | Partial | Token estimate after the model call. Not a hard spend cap |
-| Tests | Partial | Unit and Linux Docker/Postgres checks above. Three scripted repair fixtures plus the verification-return and loopback adapter tests |
+| Tests | Partial | Unit and Linux Docker/Postgres checks above. Three scripted repair fixtures, the verification-return and loopback adapter tests, and a reviewed apply against a copy of payrepo |
 | Telemetry | Partial | JSON logs and optional OTLP. Not a quality measure |
 | Windows native | Unverified | Cross-compile, including the junction test in `internal/tools`. ACL code was cross-compiled in Milestone 2 and was not executed. No Windows execution |
 | macOS | Unverified | Darwin cross-compile only. Bind-mount uid behavior is not measured |
-| Linux | Partial | `make test` and `make demo` passed on this amd64 host. arm64 was cross-compiled only |
+| Linux | Partial | `go test ./...` passed on this amd64 host with the existing sandbox tags. `make test` and `make demo` were not re-run on this branch. arm64 was cross-compiled only |
 | Windows via WSL2 | Unverified | Not run |
 
 ## Not in this branch
 
-Milestones 5–8 from the 14 October 2026 audit are not done. In particular: patch export and local apply, lease renewal, cancel/pause/resume, installable release artifacts, and an evaluation set of unfamiliar tasks. The loopback adapter test is a local OpenAI-compatible server. It is not evidence that a hosted model repaired a repository. The fake-provider fixtures remain labelled demos.
+Milestones 6–8 from the 14 October 2026 audit are not done. In particular: lease renewal, cancel, pause, and resume, installable release artifacts, and an evaluation set of unfamiliar tasks. The loopback adapter test is a local OpenAI-compatible server. It is not evidence that a hosted model repaired a repository. The fake-provider fixtures remain labelled demos. A reviewed apply is not an automatic apply, and it is not a Git commit.
 
 The roadmap is not complete.
 
 ## Handoff
 
-Stay on `milestone-3-profiles` or branch from it. Do not push unless asked.
+Stay on `milestone-5-review` or branch from it. Do not push unless asked.
 
-Milestone 4 next: a real model repair loop. The profile, the test argv, and the approval boundary stay as they are here. Do not treat the fake-provider fixtures as that loop.
+Milestone 6 next: renew job leases, fence completion, and add cancel, pause, resume, and budget resume. Keep the snapshot apply explicit. Do not treat the fake-provider fixtures as a hosted-model run.
 
 The Windows ACL and junction tests still need a Windows run before those controls can be called supported. macOS and linux/arm64 were not executed.

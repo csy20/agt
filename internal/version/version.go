@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/csy20/agt/internal/model"
+	"github.com/csy20/agt/internal/patch"
 	"github.com/csy20/agt/internal/policy"
 	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/tools"
@@ -21,6 +22,7 @@ func Compute(images ...string) string {
 		tools.Version,
 		model.PromptVersion,
 		model.TranscriptContract,
+		patch.Contract,
 		profile.Contract,
 	}
 	lines = append(lines, images...)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/model"
+	"github.com/csy20/agt/internal/patch"
 	"github.com/csy20/agt/internal/policy"
 	"github.com/csy20/agt/internal/redact"
 	"github.com/csy20/agt/internal/run"
@@ -481,6 +482,16 @@ func (o *Orchestrator) workspace(ctx context.Context, current store.Run) (worksp
 	if fresh.Worktree == "" {
 		work, _, err := workspace.Materialize(current.RepoPath, o.dataDir, current.ID)
 		if err != nil {
+			return nil, err
+		}
+		captured := workspace.ReadCapture(current.RepoPath)
+		if _, err := o.store.AppendEvent(ctx, current.ID, "workspace.captured", "system", "orchestrator", map[string]any{
+			"strategy":             patch.Strategy,
+			"revision":             captured.Revision,
+			"ref":                  captured.Ref,
+			"includes_uncommitted": true,
+			"note":                 "snapshot of the working tree, including uncommitted files; .git was not copied",
+		}); err != nil {
 			return nil, err
 		}
 		if err := o.store.SetWorktree(ctx, current.ID, work); err != nil {

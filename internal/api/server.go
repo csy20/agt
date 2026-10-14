@@ -24,6 +24,7 @@ import (
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/version"
+	"github.com/csy20/agt/internal/workspace"
 )
 
 type Server struct {
@@ -45,6 +46,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/runs/{id}/commands", s.listCommands)
 	mux.HandleFunc("GET /v1/runs/{id}/commands/{command_id}", s.getCommand)
 	mux.HandleFunc("POST /v1/runs/{id}/approvals", s.approve)
+	mux.HandleFunc("GET /v1/runs/{id}/diff", s.diff)
+	mux.HandleFunc("GET /v1/runs/{id}/patch", s.patchArtifact)
+	mux.HandleFunc("POST /v1/runs/{id}/apply", s.apply)
 	return s.guard(mux)
 }
 
@@ -96,6 +100,12 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	if err != nil || !info.IsDir() {
 		writeError(w, http.StatusBadRequest, "repo_path is not a directory")
 		return
+	}
+	if s.Config.DataDir != "" {
+		if err := workspace.Overlap(repo, s.Config.DataDir); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	provider := req.Provider
 	if provider == "" {

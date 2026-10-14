@@ -60,6 +60,9 @@ func usageText() {
   agt run create --goal TEXT --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE
   agt run status RUN
   agt run attach RUN
+  agt run diff RUN
+  agt run export RUN --output FILE
+  agt run apply RUN --digest DIGEST
   agt approve RUN COMMAND --args-hash HASH
   agt version
 
@@ -69,6 +72,7 @@ agt profile detect prints a suggestion and does not start a run.
 The fake provider is a labelled scripted demo, not a live model.
 The control plane is agtd. agt starts it when that binary sits beside agt and nothing is listening.
 agt sends the local token from AGT_TOKEN or $AGT_DATA_DIR/auth.token on every route except health.
+agt run diff and agt run export review the snapshot. agt run apply writes the source repository only after --digest matches that artifact. Leaving attach does not apply the change.
 `)
 }
 
@@ -163,6 +167,12 @@ func runCmd(args []string) int {
 			return 1
 		}
 		return attach(base, args[1])
+	case "diff":
+		return diffCmd(args[1:])
+	case "export":
+		return exportCmd(args[1:])
+	case "apply":
+		return applyCmd(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown run command %q\n", args[0])
 		return 2
@@ -420,6 +430,10 @@ func formatEvent(event string, data []byte) string {
 		return "succeeded"
 	case "run.failed":
 		return fmt.Sprintf("failed: %v", payload["reason"])
+	case "workspace.captured":
+		return fmt.Sprintf("workspace captured %v %v", payload["strategy"], payload["revision"])
+	case "patch.applied":
+		return fmt.Sprintf("applied %v files digest %v", payload["files"], payload["digest"])
 	default:
 		return ""
 	}

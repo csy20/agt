@@ -147,12 +147,17 @@ func (d *Dir) Close(ctx context.Context) error {
 // Larger files fail the copy instead of being dropped silently.
 const MaxCopyFileBytes = 8 << 20
 
-// Materialize copies repo into dataDir/runs/<id>/{work,base}.
-// Symlinks are refused. Executable bits are preserved.
-// Dotfiles and dot-directories are included except the directory names
-// reported by tools.SkipDir (.git, node_modules, build outputs, and similar)
-// and secret names such as .env, .ssh, and private keys. .env.example is copied.
+// Materialize copies the working tree, including uncommitted files, into
+// dataDir/runs/<id>/{work,base}. It does not create a Git worktree: a checkout
+// would drop uncommitted files, and the fixtures are not Git repositories.
+// The source tree is not modified. .git is not copied. Symlinks are refused.
+// Executable bits are preserved. Dotfiles are included except the directory
+// names reported by tools.SkipDir and secret names such as .env, .ssh, and
+// private keys. .env.example is copied.
 func Materialize(repo, dataDir, runID string) (work, base string, err error) {
+	if err := Overlap(repo, dataDir); err != nil {
+		return "", "", err
+	}
 	root := filepath.Join(dataDir, "runs", runID)
 	if err := os.RemoveAll(root); err != nil {
 		return "", "", err
