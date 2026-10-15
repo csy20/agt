@@ -21,7 +21,7 @@ func completion(args []string) int {
 }
 
 func rootCommands() []string {
-	return []string{"fix", "profile", "approve", "run", "doctor", "completion", "version", "help"}
+	return []string{"fix", "profile", "approve", "run", "doctor", "setup", "tui", "session", "completion", "version", "help"}
 }
 
 func runCommands() []string {
@@ -31,6 +31,7 @@ func runCommands() []string {
 func completionScript(shell string) (string, bool) {
 	roots := strings.Join(rootCommands(), " ")
 	runs := strings.Join(runCommands(), " ")
+	sessions := strings.Join(sessionCommands(), " ")
 	switch shell {
 	case "bash":
 		return fmt.Sprintf(`_agt() {
@@ -45,15 +46,19 @@ func completionScript(shell string) (string, bool) {
   if [[ ${prev} == run ]]; then
     COMPREPLY=( $(compgen -W "%s" -- "$cur") )
   fi
+  if [[ ${prev} == session ]]; then
+    COMPREPLY=( $(compgen -W "%s" -- "$cur") )
+  fi
 }
 complete -F _agt agt
-`, roots, runs), true
+`, roots, runs, sessions), true
 	case "zsh":
 		return fmt.Sprintf(`#compdef agt
 _agt() {
-  local -a commands runs
+  local -a commands runs sessions
   commands=(%s)
   runs=(%s)
+  sessions=(%s)
   if (( CURRENT == 2 )); then
     _describe command commands
     return
@@ -61,33 +66,42 @@ _agt() {
   if [[ ${words[2]} == run ]]; then
     _describe run runs
   fi
+  if [[ ${words[2]} == session ]]; then
+    _describe session sessions
+  fi
 }
 compdef _agt agt
-`, roots, runs), true
+`, roots, runs, sessions), true
 	case "fish":
 		return fmt.Sprintf(`complete -c agt -n "not __fish_seen_subcommand_from %s" -a "%s"
 complete -c agt -n "__fish_seen_subcommand_from run" -a "%s"
-`, roots, roots, runs), true
+complete -c agt -n "__fish_seen_subcommand_from session" -a "%s"
+`, roots, roots, runs, sessions), true
 	case "powershell":
-		var rootsQ, runsQ []string
+		var rootsQ, runsQ, sessionsQ []string
 		for _, name := range rootCommands() {
 			rootsQ = append(rootsQ, "'"+name+"'")
 		}
 		for _, name := range runCommands() {
 			runsQ = append(runsQ, "'"+name+"'")
 		}
+		for _, name := range sessionCommands() {
+			sessionsQ = append(sessionsQ, "'"+name+"'")
+		}
 		return fmt.Sprintf(`Register-ArgumentCompleter -Native -CommandName agt -ScriptBlock {
   param($wordToComplete, $commandAst, $cursorPosition)
   $roots = @(%s)
   $runs = @(%s)
+  $sessions = @(%s)
   $words = @($commandAst.CommandElements | ForEach-Object { $_.ToString() })
   $choices = $roots
   if ($words.Count -ge 2 -and $words[1] -eq 'run') { $choices = $runs }
+  if ($words.Count -ge 2 -and $words[1] -eq 'session') { $choices = $sessions }
   $choices | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
     [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
   }
 }
-`, strings.Join(rootsQ, ","), strings.Join(runsQ, ",")), true
+`, strings.Join(rootsQ, ","), strings.Join(runsQ, ","), strings.Join(sessionsQ, ",")), true
 	default:
 		return "", false
 	}

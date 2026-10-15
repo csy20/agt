@@ -6,6 +6,7 @@
 ./cmd/agtd
 ./internal/auth
 ./internal/cli
+./internal/client
 ./internal/config
 ./internal/diag
 ./internal/model
@@ -15,8 +16,10 @@
 ./internal/redact
 ./internal/run
 ./internal/sandbox
+./internal/setup
 ./internal/telemetry
 ./internal/testutil
+./internal/tui
 ./internal/tools
 ./internal/usage
 ./internal/version

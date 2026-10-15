@@ -20,6 +20,9 @@ type Request struct {
 	Observations   []Observation
 	Transcript     []Turn
 	CompletedCalls int
+	// Display receives assistant text as it arrives. It must not run tools.
+	// Tool calls are returned only after the body is complete and the arguments are valid JSON.
+	Display func(text string)
 }
 
 type Response struct {

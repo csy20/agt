@@ -52,6 +52,27 @@ func Overlap(repo, dataDir string) error {
 	return nil
 }
 
+// CanonicalRepo is the cleaned absolute directory with symlinks resolved.
+// The path must already exist and be a directory.
+func CanonicalRepo(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("repo_path is required")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("repo_path is not a directory")
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
+}
+
 func canonical(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {

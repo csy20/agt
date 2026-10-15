@@ -109,7 +109,8 @@ func (s *Store) CommitModelIntent(ctx context.Context, runID string, fromVersion
 		if next != cur.State && !run.Can(cur.State, next) {
 			return fmt.Errorf("illegal transition %s -> %s", cur.State, next)
 		}
-		modelName := nonempty(in.ModelName, in.Model)
+		// The provider label is not a model name. An empty configured name stays empty.
+		modelName := in.ModelName
 		profName := profileName(cur.ProfileJSON)
 		if err := insertUsage(ctx, tx, runID, "model.call", int64(in.InputTokens+in.OutputTokens), in.CostMicros, modelName, profName); err != nil {
 			return err

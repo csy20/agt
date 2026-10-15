@@ -30,6 +30,58 @@ type Result struct {
 	Reason    string
 }
 
+// DecideFor applies Decide, then the run's interaction mode.
+// agent keeps the normal repair policy. ask and plan stay read-only:
+// search, read, and diff may proceed, and every mutation or test run is denied.
+// An empty mode is agent, which is the historical default.
+func DecideFor(interaction, tool string, raw json.RawMessage) (Result, error) {
+	result, err := Decide(tool, raw)
+	if err != nil {
+		return result, err
+	}
+	switch NormalizeInteraction(interaction) {
+	case "agent":
+		return result, nil
+	case "ask", "plan":
+		if result.Decision == Deny || readOnlyTool(tool) {
+			return result, nil
+		}
+		result.Decision = Deny
+		result.Reason = "ask and plan modes are read-only"
+		return result, nil
+	default:
+		return denied(tool, raw, "unknown interaction mode"), nil
+	}
+}
+
+// NormalizeInteraction maps an empty value to agent.
+func NormalizeInteraction(interaction string) string {
+	interaction = strings.TrimSpace(interaction)
+	if interaction == "" {
+		return "agent"
+	}
+	return interaction
+}
+
+// ValidInteraction reports whether a create request may store this mode.
+func ValidInteraction(interaction string) bool {
+	switch NormalizeInteraction(interaction) {
+	case "agent", "ask", "plan":
+		return true
+	default:
+		return false
+	}
+}
+
+func readOnlyTool(tool string) bool {
+	switch tool {
+	case "search_code", "read_file_range", "git_diff":
+		return true
+	default:
+		return false
+	}
+}
+
 // Decide validates tool arguments and assigns a risk decision.
 // Invalid or unknown tools are denied. They never become an execution.
 func Decide(tool string, raw json.RawMessage) (Result, error) {

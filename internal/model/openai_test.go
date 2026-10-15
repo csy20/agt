@@ -165,6 +165,143 @@ func TestOpenAIStreamsOneToolCall(t *testing.T) {
 	}
 }
 
+func TestStreamShowsTextBeforeAToolCallIsReturned(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Looking at \"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"charge.\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s\",\"function\":{\"name\":\"search_code\",\"arguments\":\"\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"query\\\":\\\"def charge\\\"}\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n")
+	}))
+	defer srv.Close()
+	var shown []string
+	client := NewOpenAI(srv.URL, "test-key", "configured-model")
+	client.HTTP = srv.Client()
+	resp, err := client.Complete(context.Background(), Request{
+		Goal: "fix",
+		Display: func(text string) {
+			shown = append(shown, text)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(shown, "") != "Looking at charge." {
+		t.Fatalf("display %q", shown)
+	}
+	for _, text := range shown {
+		if strings.Contains(text, "query") || strings.Contains(text, "search_code") {
+			t.Fatalf("display included a tool call: %q", text)
+		}
+	}
+	if resp.Tool != "search_code" || !strings.Contains(string(resp.Args), "def charge") {
+		t.Fatalf("response %+v", resp)
+	}
+}
+
+func TestFragmentedArgumentsParseOnlyWhenComplete(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s\",\"function\":{\"name\":\"search_code\",\"arguments\":\"{\\\"que\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ry\\\":\\\"idempotency_key\\\"}\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n")
+	}))
+	defer srv.Close()
+	client := NewOpenAI(srv.URL, "test-key", "configured-model")
+	client.HTTP = srv.Client()
+	resp, err := client.Complete(context.Background(), Request{Goal: "fix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Tool != "search_code" || !strings.Contains(string(resp.Args), "idempotency_key") {
+		t.Fatalf("response %+v", resp)
+	}
+}
+
+func TestMalformedStreamDoesNotReturnATool(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"no\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {not-json}\n\n")
+	}))
+	defer srv.Close()
+	var shown []string
+	client := NewOpenAI(srv.URL, "test-key", "configured-model")
+	client.HTTP = srv.Client()
+	resp, err := client.Complete(context.Background(), Request{
+		Goal:    "fix",
+		Display: func(text string) { shown = append(shown, text) },
+	})
+	if err == nil || resp.Tool != "" {
+		t.Fatalf("err %v resp %+v", err, resp)
+	}
+	if strings.Join(shown, "") != "no" {
+		t.Fatalf("display %q", shown)
+	}
+}
+
+func TestInterruptedStreamDoesNotReturnATool(t *testing.T) {
+	client := NewOpenAI("http://model.invalid/v1", "test-key", "configured-model")
+	client.HTTP = &http.Client{Transport: cutStream{}}
+	var shown []string
+	resp, err := client.Complete(context.Background(), Request{
+		Goal:    "fix",
+		Display: func(text string) { shown = append(shown, text) },
+	})
+	if err == nil || resp.Tool != "" {
+		t.Fatalf("err %v resp %+v", err, resp)
+	}
+	if strings.Join(shown, "") != "Looking" {
+		t.Fatalf("display %q", shown)
+	}
+}
+
+type cutStream struct{}
+
+func (cutStream) RoundTrip(*http.Request) (*http.Response, error) {
+	body := io.MultiReader(
+		strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"Looking\"}}]}\n\n"),
+		strings.NewReader("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n"),
+		errReader{},
+	)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(body),
+	}, nil
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestPartialToolCallIsNotReturned(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial \"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s\",\"function\":{\"name\":\"search_code\",\"arguments\":\"{\"}}]}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n")
+	}))
+	defer srv.Close()
+	var shown []string
+	client := NewOpenAI(srv.URL, "test-key", "configured-model")
+	client.HTTP = srv.Client()
+	resp, err := client.Complete(context.Background(), Request{
+		Goal:    "fix",
+		Display: func(text string) { shown = append(shown, text) },
+	})
+	if err == nil || !strings.Contains(err.Error(), "not JSON") {
+		t.Fatalf("err %v resp %+v", err, resp)
+	}
+	if strings.Join(shown, "") != "partial " {
+		t.Fatalf("display %q", shown)
+	}
+	if resp.Tool != "" {
+		t.Fatalf("partial tool was returned: %+v", resp)
+	}
+}
+
 func TestOpenAILoopbackOmitsTheAPIKey(t *testing.T) {
 	var auth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

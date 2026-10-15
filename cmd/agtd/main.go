@@ -110,7 +110,9 @@ func run() int {
 				if err != nil {
 					return nil, err
 				}
-				return model.NewFake(script), nil
+				fake := model.NewFake(script)
+				fake.ModelName = cfg.ModelName
+				return fake, nil
 			case "openai":
 				return model.NewOpenAI(cfg.ModelBaseURL, cfg.ModelAPIKey, cfg.ModelName), nil
 			default:

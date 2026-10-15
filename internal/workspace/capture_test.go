@@ -7,6 +7,35 @@ import (
 	"testing"
 )
 
+func TestCanonicalRepoResolvesTheSameDirectory(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	fromReal, err := CanonicalRepo(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromLink, err := CanonicalRepo(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromReal != fromLink {
+		t.Fatalf("real %s link %s", fromReal, fromLink)
+	}
+	file := filepath.Join(real, "a.txt")
+	if err := os.WriteFile(file, []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CanonicalRepo(file); err == nil {
+		t.Fatal("a file was accepted as a repository")
+	}
+	if _, err := CanonicalRepo(" "); err == nil {
+		t.Fatal("an empty path was accepted")
+	}
+}
+
 func TestMaterializeRejectsNestedDataAndRepo(t *testing.T) {
 	repo := t.TempDir()
 	if err := os.WriteFile(filepath.Join(repo, "keep.txt"), []byte("stay\n"), 0o644); err != nil {

@@ -8,6 +8,45 @@ import (
 	"testing"
 )
 
+func TestAskAndPlanStayReadOnly(t *testing.T) {
+	readRaw := json.RawMessage(`{"path":"payments/processor.py","start":1,"end":40}`)
+	patchRaw := json.RawMessage(`{"path":"payments/processor.py","old":"return err","new":"return None"}`)
+	testRaw := json.RawMessage(`{}`)
+	for _, mode := range []string{"ask", "plan"} {
+		read, err := DecideFor(mode, "read_file_range", readRaw)
+		if err != nil || read.Decision != Allow {
+			t.Fatalf("%s read: %+v %v", mode, read, err)
+		}
+		base, err := Decide("apply_patch", patchRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := DecideFor(mode, "apply_patch", patchRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Decision != Deny || !strings.Contains(got.Reason, "read-only") || got.ArgsHash != base.ArgsHash {
+			t.Fatalf("%s patch: %+v", mode, got)
+		}
+		runTest, err := DecideFor(mode, "run_test", testRaw)
+		if err != nil || runTest.Decision != Deny || !strings.Contains(runTest.Reason, "read-only") {
+			t.Fatalf("%s run_test: %+v %v", mode, runTest, err)
+		}
+	}
+	agent, err := DecideFor("agent", "run_test", testRaw)
+	if err != nil || agent.Decision != Allow {
+		t.Fatalf("agent run_test: %+v %v", agent, err)
+	}
+	same, err := DecideFor("", "run_test", testRaw)
+	if err != nil || same.Decision != Allow || same.ArgsHash != agent.ArgsHash {
+		t.Fatalf("empty mode: %+v", same)
+	}
+	push, err := DecideFor("plan", "git_push", json.RawMessage(`{"remote":"origin","branch":"main","commit":"abc123"}`))
+	if err != nil || push.Decision != Deny || !strings.Contains(push.Reason, "unsupported") {
+		t.Fatalf("plan push kept the hard denial: %+v", push)
+	}
+}
+
 func TestReadAndPatchDecisions(t *testing.T) {
 	ok, err := Decide("read_file_range", json.RawMessage(`{"path":"payments/processor.py","start":1,"end":40}`))
 	if err != nil {

@@ -160,6 +160,40 @@ func pythonProfile() map[string]any {
 	}
 }
 
+func TestInteractionIsStoredWithoutTheSession(t *testing.T) {
+	st := testutil.Open(t)
+	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}, testToken).Handler())
+	t.Cleanup(ts.Close)
+	body := map[string]any{
+		"goal":         "what does charge do?",
+		"repo_path":    testutil.Fixture(t),
+		"provider":     "fake",
+		"script_path":  filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+		"budget_cents": 100,
+		"max_steps":    4,
+		"profile":      pythonProfile(),
+		"interaction":  "ask",
+	}
+	created := postRun(t, ts.URL, body, "idem-ask")
+	if created.status != http.StatusAccepted {
+		t.Fatalf("create %d %s", created.status, created.body)
+	}
+	view := getJSON(t, ts.URL+"/v1/runs/"+created.runID)
+	if view["interaction"] != "ask" {
+		t.Fatalf("interaction %#v", view["interaction"])
+	}
+	body["interaction"] = "plan"
+	conflict := postRun(t, ts.URL, body, "idem-ask")
+	if conflict.status != http.StatusConflict {
+		t.Fatalf("plan replay %d %s", conflict.status, conflict.body)
+	}
+	body["interaction"] = "repair"
+	rejected := postRun(t, ts.URL, body, "idem-repair")
+	if rejected.status != http.StatusBadRequest || !strings.Contains(rejected.body, "interaction") {
+		t.Fatalf("bad mode %d %s", rejected.status, rejected.body)
+	}
+}
+
 func TestScriptedPushIsDeniedNotSuccessful(t *testing.T) {
 	st := testutil.Open(t)
 	eng := testutil.NewEngine(t, st, orch.Hooks{})

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/csy20/agt/internal/diag"
 	"github.com/csy20/agt/internal/id"
-	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/run"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -26,7 +24,8 @@ const runColumns = `
 id, idempotency_key, request_hash, goal, repo_path, worktree, state, state_version,
 risk_level, budget_cents, spent_micros, agent_version, trace_id, provider, script_path,
 COALESCE(script_json, 'null'::jsonb), COALESCE(plan_json, 'null'::jsonb), COALESCE(result_json, 'null'::jsonb),
-error, step_count, max_steps, deadline_at, created_at, updated_at, profile_json`
+error, step_count, max_steps, deadline_at, created_at, updated_at, profile_json, interaction,
+COALESCE(session_id, '')`
 
 type Store struct {
 	pool *pgxpool.Pool
@@ -58,6 +57,8 @@ type Run struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	ProfileJSON    json.RawMessage
+	Interaction    string
+	SessionID      string
 }
 
 type Event struct {
@@ -84,6 +85,8 @@ type CreateInput struct {
 	ScriptPath     string
 	ScriptJSON     json.RawMessage
 	ProfileJSON    json.RawMessage
+	Interaction    string
+	SessionID      string
 }
 
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -119,7 +122,13 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.applyMigration(ctx, 3, "migrations/003_transcript.sql"); err != nil {
 		return err
 	}
-	return s.applyMigration(ctx, 4, "migrations/004_lease.sql")
+	if err := s.applyMigration(ctx, 4, "migrations/004_lease.sql"); err != nil {
+		return err
+	}
+	if err := s.applyMigration(ctx, 5, "migrations/005_interaction.sql"); err != nil {
+		return err
+	}
+	return s.applyMigration(ctx, 6, "migrations/006_sessions.sql")
 }
 
 func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
@@ -191,7 +200,8 @@ func (s *Store) migrationApplied(ctx context.Context, version int) (bool, error)
 
 func (s *Store) Reset(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
-		TRUNCATE model_messages, usage_entries, approvals, commands, run_events, run_jobs, runs
+		TRUNCATE model_messages, usage_entries, approvals, commands, run_events, run_jobs,
+			session_messages, runs, sessions
 		RESTART IDENTITY CASCADE`)
 	return err
 }
@@ -218,45 +228,17 @@ func (s *Store) CreateRun(ctx context.Context, in CreateInput) (Run, bool, error
 	if in.WallSeconds <= 0 {
 		in.WallSeconds = 300
 	}
-	deadline := time.Now().Add(time.Duration(in.WallSeconds) * time.Second)
-	var script any
-	if len(in.ScriptJSON) > 0 {
-		script = string(in.ScriptJSON)
-	}
-	profileJSON := in.ProfileJSON
-	if len(bytes.TrimSpace(profileJSON)) == 0 {
-		profileJSON = []byte(`{}`)
-	}
-	var identity any
-	if parsed, err := profile.Parse(profileJSON); err == nil {
-		identity = parsed.Identity()
+	switch in.Interaction {
+	case "", "agent":
+		in.Interaction = "agent"
+	case "ask", "plan":
+	default:
+		return Run{}, false, fmt.Errorf("interaction must be agent, ask, or plan")
 	}
 	var out Run
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO runs (
-				id, idempotency_key, request_hash, goal, repo_path, state, state_version,
-				budget_cents, agent_version, trace_id, provider, script_path, script_json,
-				max_steps, deadline_at, profile_json
-			) VALUES (
-				$1,$2,$3,$4,$5,'CREATED',1,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb
-			)`,
-			in.ID, in.IdempotencyKey, in.RequestHash, in.Goal, in.RepoPath, in.BudgetCents,
-			in.AgentVersion, in.TraceID, in.Provider, in.ScriptPath, script, in.MaxSteps, deadline,
-			string(profileJSON),
-		)
-		if err != nil {
-			return err
-		}
-		if _, err := appendEvent(ctx, tx, in.ID, "run.created", "user", "local", map[string]any{
-			"goal": in.Goal, "repo_path": in.RepoPath, "provider": in.Provider, "profile": identity,
-		}); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO run_jobs (run_id, status) VALUES ($1, 'queued')`, in.ID); err != nil {
-			return err
-		}
-		out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM runs WHERE id=$1`, in.ID))
+		var err error
+		out, err = insertRunTx(ctx, tx, in)
 		return err
 	})
 	if err != nil {
@@ -399,6 +381,16 @@ func (s *Store) SetWorktree(ctx context.Context, runID, path string) error {
 	return nil
 }
 
+// AppendDisplay records assistant text for the session to show while the
+// model response is still being read. It does not execute a tool.
+func (s *Store) AppendDisplay(ctx context.Context, runID, text string) error {
+	if text == "" {
+		return nil
+	}
+	_, err := s.AppendEvent(ctx, runID, "assistant.delta", "model", "display", map[string]any{"text": text})
+	return err
+}
+
 func (s *Store) SetResult(ctx context.Context, runID string, result any, errText string) error {
 	body, err := json.Marshal(result)
 	if err != nil {
@@ -450,7 +442,7 @@ func scanRun(row pgx.Row) (Run, error) {
 		&state, &r.StateVersion, &r.RiskLevel, &r.BudgetCents, &r.SpentMicros,
 		&r.AgentVersion, &r.TraceID, &r.Provider, &r.ScriptPath,
 		&script, &plan, &result, &r.Error, &r.StepCount, &r.MaxSteps,
-		&r.Deadline, &r.CreatedAt, &r.UpdatedAt, &profileJSON,
+		&r.Deadline, &r.CreatedAt, &r.UpdatedAt, &profileJSON, &r.Interaction, &r.SessionID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Run{}, ErrNotFound

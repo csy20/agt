@@ -125,8 +125,10 @@ type Engine struct {
 	images  profile.Images
 
 	// Provider, when set, answers model turns. ProviderName is stored on the run.
+	// ModelName is the configured identity recorded for the fake provider.
 	Provider     model.Provider
 	ProviderName string
+	ModelName    string
 }
 
 func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
@@ -152,7 +154,9 @@ func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 			if err != nil {
 				return nil, err
 			}
-			return model.NewFake(script), nil
+			fake := model.NewFake(script)
+			fake.ModelName = eng.ModelName
+			return fake, nil
 		},
 		NewWorkspace: func(current store.Run) (workspace.Handle, error) {
 			eng.mu.Lock()
@@ -206,6 +210,34 @@ func PayrepoRequest() profile.Request {
 func (e *Engine) Create(t *testing.T, goal, repo string, budget, maxSteps int, script []byte) store.Run {
 	t.Helper()
 	return e.CreateWithProfile(t, goal, repo, budget, maxSteps, script, e.MustProfile(t, PayrepoRequest()))
+}
+
+// CreateInteraction stores ask, plan, or agent on the run. The daemon policy
+// reads that field. A terminal session is not required.
+func (e *Engine) CreateInteraction(t *testing.T, goal, repo, interaction string, budget, maxSteps int, script []byte) store.Run {
+	t.Helper()
+	prof := e.MustProfile(t, PayrepoRequest())
+	raw, err := prof.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, _, err := e.Store.CreateRun(context.Background(), store.CreateInput{
+		Goal:         goal,
+		RepoPath:     repo,
+		BudgetCents:  budget,
+		MaxSteps:     maxSteps,
+		WallSeconds:  300,
+		AgentVersion: version.Compute(e.images.Python, e.images.Go, e.images.Node),
+		Provider:     providerName(e),
+		RequestHash:  id.New("req_"),
+		ScriptJSON:   script,
+		ProfileJSON:  raw,
+		Interaction:  interaction,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	return created
 }
 
 func (e *Engine) CreateWithProfile(t *testing.T, goal, repo string, budget, maxSteps int, script []byte, prof profile.Profile) store.Run {

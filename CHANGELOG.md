@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Not a published release. The product version stays `0.1.0` so this client still matches `agtd`.
+
+- Interactive session: `agt` on a terminal, `agt tui`, and `agt tui --dump`. The dump is example data and does not change a repository. Approvals stay bound to the argument hash. Apply stays bound to the digest. Ctrl+C leaves the screen and does not cancel or apply.
+- Ask and plan are stored on the run. The daemon denies writes, test runs, and other mutations in those modes, including a create that bypasses the session. They finish with outcome `answered` and do not run repair verification. An empty interaction stays `agent`. `risk_level` is unchanged. Migration `005_interaction.sql` adds the column.
+- Assistant text can be shown while the response is read. A tool call is still returned only after the body is complete and the arguments are valid JSON. An interrupted stream that has already shown text is not retried. Reconnecting does not repeat the edit.
+- Approval and apply keys act on the focused confirm line. Composer text does not approve or apply. Routine hashes and digests are abbreviated. `ctrl+f` and the apply confirmation show the full values. The cent limit is labelled an estimate. Untrusted terminal controls are stripped from rendered text. Demo scenes stay out of a live session.
+- `agt setup --confirm` records a profile and a test command. It does not select an image or start a run.
+- Sessions are stored apart from runs. Migration `006_sessions.sql` adds `sessions`, ordered `session_messages`, and a nullable `runs.session_id`. A standalone run still works. `agt session list|new|open|show|submit` and `/sessions` reopen a session. An active session attaches to its existing run. A finished session shows its history. Neither starts work, replays a tool, or applies a patch. A repeated client message id does not create a second message or run. A new prompt while a run is active is refused and does not change that goal. A session stays bound to its canonical repository path. A new `/fix` uses a fresh snapshot. An unapplied patch stays pending, and the note says its edits are absent from that snapshot.
+- A fake-provider result and its usage row record the configured model name when one is set. The provider stays the scripted fake provider. An unset model name stays empty. The provider string is not stored as the model name.
+
 ## 0.1.0
 
 Local reviewable beta. Not published. Not an external beta for macOS, Windows, or linux/arm64.

@@ -47,6 +47,9 @@ func ParseScript(raw []byte) (Script, error) {
 
 type Fake struct {
 	Script Script
+	// ModelName is the configured identity, such as AGT_MODEL_NAME.
+	// It is recorded on usage and results. It does not mean a hosted model ran.
+	ModelName string
 }
 
 func NewFake(script Script) *Fake {
@@ -66,9 +69,13 @@ func (f *Fake) Complete(_ context.Context, req Request) (Response, error) {
 		Finish:       step.Finish,
 		InputTokens:  step.InputTokens,
 		OutputTokens: step.OutputTokens,
+		ModelName:    f.ModelName,
 	}
 	if resp.Finish && resp.Text == "" {
 		resp.Text = "finished"
+	}
+	if req.Display != nil && resp.Text != "" {
+		req.Display(resp.Text)
 	}
 	return resp, nil
 }

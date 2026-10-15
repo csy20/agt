@@ -51,7 +51,7 @@ func Fit(turns []Turn, budget int) []Turn {
 			goalKept = true
 			continue
 		}
-		if turn.Role == "user" && strings.HasPrefix(turn.Content, "DATA origin=repo-summary") {
+		if turn.Role == "user" && (strings.HasPrefix(turn.Content, "DATA origin=repo-summary") || strings.HasPrefix(turn.Content, "DATA origin=session-history")) {
 			prefix = append(prefix, turn)
 			continue
 		}
@@ -61,24 +61,89 @@ func Fit(turns []Turn, budget int) []Turn {
 	for _, turn := range prefix {
 		used += turnTokens(turn)
 	}
-	var tail []Turn
-	for i := len(rest) - 1; i >= 0; i-- {
-		cost := turnTokens(rest[i])
-		if len(tail) > 0 && used+cost > budget {
+	groups := toolGroups(rest)
+	kept := map[int]bool{}
+	chosen := 0
+	for i := len(groups) - 1; i >= 0; i-- {
+		group := groups[i]
+		if orphanTool(rest, group) {
+			continue
+		}
+		cost := 0
+		for _, idx := range group {
+			cost += turnTokens(rest[idx])
+		}
+		if chosen > 0 && used+cost > budget {
 			break
 		}
-		tail = append([]Turn{rest[i]}, tail...)
+		for _, idx := range group {
+			kept[idx] = true
+		}
+		chosen++
 		used += cost
 		if used > budget {
 			break
 		}
 	}
-	omitted := rest[:len(rest)-len(tail)]
+	var tail, omitted []Turn
+	for i, turn := range rest {
+		if kept[i] {
+			tail = append(tail, turn)
+			continue
+		}
+		omitted = append(omitted, turn)
+	}
 	if len(omitted) == 0 {
 		return append(prefix, tail...)
 	}
 	summary := Turn{Role: "user", Content: summarizeTurns(omitted)}
 	return append(append(prefix, summary), tail...)
+}
+
+// toolGroups keeps an assistant tool call and its matching tool result together.
+// Indexes point into rest. A result without its call is left as its own group.
+func toolGroups(rest []Turn) [][]int {
+	callAt := map[string]int{}
+	for i, turn := range rest {
+		if turn.Role == "assistant" && turn.ToolCallID != "" {
+			callAt[turn.ToolCallID] = i
+		}
+	}
+	used := map[int]bool{}
+	var groups [][]int
+	for i, turn := range rest {
+		if used[i] {
+			continue
+		}
+		if turn.Role == "assistant" && turn.ToolCallID != "" {
+			for j := i + 1; j < len(rest); j++ {
+				if rest[j].Role == "tool" && rest[j].ToolCallID == turn.ToolCallID {
+					used[j] = true
+					groups = append(groups, []int{i, j})
+					used[i] = true
+					break
+				}
+			}
+			if used[i] {
+				continue
+			}
+		}
+		if turn.Role == "tool" && turn.ToolCallID != "" {
+			if idx, ok := callAt[turn.ToolCallID]; ok && idx < i {
+				continue
+			}
+		}
+		groups = append(groups, []int{i})
+	}
+	return groups
+}
+
+func orphanTool(rest []Turn, group []int) bool {
+	if len(group) != 1 {
+		return false
+	}
+	turn := rest[group[0]]
+	return turn.Role == "tool" && turn.ToolCallID != ""
 }
 
 func turnTokens(turn Turn) int {

@@ -22,6 +22,9 @@ import (
 
 func Run(args []string) int {
 	if len(args) < 2 {
+		if terminalSession() {
+			return tuiCmd(nil)
+		}
 		usageText()
 		return 2
 	}
@@ -39,6 +42,12 @@ func Run(args []string) int {
 		return runCmd(args[2:])
 	case "doctor":
 		return doctor(args[2:])
+	case "tui":
+		return tuiCmd(args[2:])
+	case "session":
+		return sessionCmd(args[2:])
+	case "setup":
+		return setupCmd(args[2:])
 	case "completion":
 		return completion(args[2:])
 	case "help", "-h", "--help":
@@ -71,10 +80,23 @@ func usageText() {
   agt run cleanup
   agt approve RUN COMMAND --args-hash HASH
   agt doctor [--json]
+  agt setup --repo PATH --profile NAME --test-arg ARG --confirm
+  agt tui [--demo] [--dump] [--repo PATH] [--session ID]
+  agt session list [--repo PATH]
+  agt session new [--repo PATH]
+  agt session open SESSION [--repo PATH]
+  agt session show SESSION [--repo PATH]
+  agt session submit SESSION --goal TEXT --repo PATH --profile NAME --message-id ID
   agt completion bash|zsh|fish|powershell
   agt version
 
---profile is required. --repo does not select a language or a test command.
+With no command, a terminal opens the session. A pipe still prints this usage.
+agt session open attaches to an active run and only prints history when the session is idle. Neither starts work or applies a patch.
+A repeated --message-id returns the original run. A new prompt while a run is active is refused and does not change that run's goal.
+agt tui --dump prints an example session. It does not start a run or change a repository.
+agt setup writes a profile and a test command after --confirm. It does not choose an image or start a run.
+/plan and /ask inside the session are read-only. The repair state PLANNING still executes.
+--profile is required for agt fix. --repo does not select a language or a test command.
 agt profile detect prints a suggestion and does not start a run.
 --provider defaults to AGT_PROVIDER. --model checks AGT_MODEL_NAME on agtd and does not call a hosted model.
 The fake provider is a labelled scripted demo, not a live model.
@@ -314,6 +336,15 @@ func approve(args []string) int {
 	return 0
 }
 
+func terminalSession() bool {
+	out, err := os.Stdout.Stat()
+	if err != nil || out.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	in, err := os.Stdin.Stat()
+	return err == nil && in.Mode()&os.ModeCharDevice != 0
+}
+
 func asInt64(v any) (int64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -351,6 +382,9 @@ func formatEvent(event string, data []byte) string {
 		return fmt.Sprintf("approval required %v %v hash %v", payload["tool"], payload["command_id"], payload["args_hash"])
 	case "approval.recorded":
 		return fmt.Sprintf("approval %v", payload["decision"])
+	case "assistant.delta":
+		text, _ := payload["text"].(string)
+		return text
 	case "budget.paused":
 		return "paused: budget"
 	case "run.succeeded":

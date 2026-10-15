@@ -162,6 +162,7 @@ func (o *Orchestrator) dispatch(ctx context.Context, current store.Run) error {
 		_, _ = o.store.AppendEvent(ctx, current.ID, "run.succeeded", "system", "orchestrator", map[string]any{
 			"run_id": current.ID,
 		})
+		o.recordSessionResult(ctx, current.ID)
 		return nil
 	default:
 		return fmt.Errorf("no handler for state %s", current.State)
@@ -288,6 +289,11 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 		Observations:   obs,
 		Transcript:     turns,
 		CompletedCalls: completed,
+		// Text may be stored before this call returns. The tool is not executed
+		// until CommitModelIntent, and only when the response carried a complete call.
+		Display: func(text string) {
+			_ = o.store.AppendDisplay(ctx, current.ID, text)
+		},
 	})
 	if err != nil {
 		o.noteAttempts(ctx, current, err)
@@ -315,7 +321,7 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 	} else if resp.Tool == "" {
 		return fmt.Errorf("model returned no action")
 	} else {
-		decision, err := policy.Decide(resp.Tool, resp.Args)
+		decision, err := policy.DecideFor(current.Interaction, resp.Tool, resp.Args)
 		if err != nil {
 			return err
 		}
@@ -507,6 +513,12 @@ func (o *Orchestrator) perform(ctx context.Context, current store.Run, cmd store
 const maxVerificationReturns = 2
 
 func (o *Orchestrator) verify(ctx context.Context, current store.Run) error {
+	switch policy.NormalizeInteraction(current.Interaction) {
+	case "ask", "plan":
+		// An answer is the terminal result. Repair verification, including the
+		// baseline test, is not part of these modes.
+		return o.finishAnswer(ctx, current)
+	}
 	ws, err := o.workspace(ctx, current)
 	if err != nil {
 		return o.finishUnverified(ctx, current, "verification_unavailable", "workspace: "+err.Error())
@@ -712,6 +724,7 @@ func (o *Orchestrator) fail(ctx context.Context, current store.Run, cause error)
 			"reason": cause.Error(), "category": failureCategory(cause),
 		})
 	}
+	o.recordSessionResult(ctx, current.ID)
 	return nil
 }
 
@@ -774,7 +787,7 @@ func (o *Orchestrator) seedContext(ctx context.Context, current store.Run) error
 	if err != nil {
 		return err
 	}
-	hasSystem, hasGoal, hasSummary := false, false, false
+	hasSystem, hasGoal, hasSummary, hasHistory := false, false, false, false
 	for _, msg := range msgs {
 		switch {
 		case msg.Role == "system":
@@ -783,6 +796,8 @@ func (o *Orchestrator) seedContext(ctx context.Context, current store.Run) error
 			hasGoal = true
 		case msg.Role == "user" && strings.HasPrefix(msg.Content, "DATA origin=repo-summary"):
 			hasSummary = true
+		case msg.Role == "user" && strings.HasPrefix(msg.Content, "DATA origin=session-history"):
+			hasHistory = true
 		}
 	}
 	if !hasSystem {
@@ -804,6 +819,17 @@ func (o *Orchestrator) seedContext(ctx context.Context, current store.Run) error
 			return err
 		}
 	}
+	if current.SessionID != "" && !hasHistory {
+		history, err := o.sessionHistory(ctx, current)
+		if err != nil {
+			return err
+		}
+		if history != "" {
+			if err := o.store.AppendMessage(ctx, current.ID, store.TranscriptMessage{Role: "user", Content: history}); err != nil {
+				return err
+			}
+		}
+	}
 	fresh, err := o.store.GetRun(ctx, current.ID)
 	if err != nil {
 		return err
@@ -813,6 +839,31 @@ func (o *Orchestrator) seedContext(ctx context.Context, current store.Run) error
 	}
 	_, err = o.store.Transition(ctx, current.ID, fresh.StateVersion, run.Planning, "orchestrator")
 	return err
+}
+
+func (o *Orchestrator) sessionHistory(ctx context.Context, current store.Run) (string, error) {
+	msgs, err := o.store.ListSessionMessages(ctx, current.SessionID)
+	if err != nil {
+		return "", err
+	}
+	facts := make([]model.SessionFact, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg.RunID == current.ID && msg.Kind == "user" {
+			continue
+		}
+		facts = append(facts, model.SessionFact{
+			Seq: msg.Seq, Role: msg.Role, Kind: msg.Kind, Content: msg.Content, RunID: msg.RunID,
+		})
+	}
+	return model.SessionHistory(facts, 1500), nil
+}
+
+func (o *Orchestrator) recordSessionResult(ctx context.Context, runID string) {
+	current, err := o.store.GetRun(ctx, runID)
+	if err != nil || current.SessionID == "" {
+		return
+	}
+	_ = o.store.RecordSessionResult(ctx, current)
 }
 
 func (o *Orchestrator) requestTurns(ctx context.Context, current store.Run) ([]model.Turn, error) {
@@ -832,6 +883,52 @@ func (o *Orchestrator) requestTurns(ctx context.Context, current store.Run) ([]m
 		fitted = append(fitted, model.Turn{Role: "user", Content: "DATA origin=plan\n" + string(current.Plan)})
 	}
 	return fitted, nil
+}
+
+// finishAnswer records the model's text and moves the run to COMMITTING.
+// It does not open a test sandbox and does not record a baseline.
+func (o *Orchestrator) finishAnswer(ctx context.Context, current store.Run) error {
+	msgs, err := o.store.ListMessages(ctx, current.ID)
+	if err != nil {
+		return err
+	}
+	text := ""
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" && msgs[i].ToolName == "" && strings.TrimSpace(msgs[i].Content) != "" {
+			text = msgs[i].Content
+			break
+		}
+	}
+	if strings.TrimSpace(text) == "" {
+		return o.finishUnverified(ctx, current, "answer_missing", "ask and plan finished without an answer")
+	}
+	modelName, err := o.latestModelName(ctx, current.ID)
+	if err != nil {
+		return err
+	}
+	if err := o.closeBounded(current.ID); err != nil {
+		return err
+	}
+	fresh, err := o.store.GetRun(ctx, current.ID)
+	if err != nil {
+		return err
+	}
+	mode := policy.NormalizeInteraction(current.Interaction)
+	if err := o.store.SetResult(ctx, current.ID, map[string]any{
+		"summary": text, "outcome": "answered", "provider": current.Provider,
+		"model_name":   modelName,
+		"interaction":  mode,
+		"tests":        map[string]any{"invoked": false},
+		"spent_micros": fresh.SpentMicros,
+	}, ""); err != nil {
+		return err
+	}
+	fresh, err = o.store.GetRun(ctx, current.ID)
+	if err != nil {
+		return err
+	}
+	_, err = o.store.Transition(ctx, current.ID, fresh.StateVersion, run.Committing, "orchestrator")
+	return err
 }
 
 func (o *Orchestrator) finishUnverified(ctx context.Context, current store.Run, outcome, reason string) error {
@@ -857,6 +954,7 @@ func (o *Orchestrator) finishUnverified(ctx context.Context, current store.Run, 
 		return err
 	}
 	_, _ = o.store.AppendEvent(ctx, current.ID, "run.failed", "system", "verifier", map[string]any{"reason": reason, "outcome": outcome})
+	o.recordSessionResult(ctx, current.ID)
 	return nil
 }
 

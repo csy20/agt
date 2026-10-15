@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -201,13 +202,26 @@ func (c *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 		if useMinimal {
 			payload = minimal
 		}
-		status, raw, err := c.post(ctx, payload)
+		var streamed bool
+		onText := func(text string) {
+			if text == "" || req.Display == nil {
+				return
+			}
+			streamed = true
+			req.Display(text)
+		}
+		status, raw, err := c.post(ctx, payload, onText)
 		posts++
 		if err != nil {
 			if ctx.Err() != nil {
 				return Response{}, ctx.Err()
 			}
 			last = err
+			// A later attempt would append the same delta again. The partial
+			// body is not a tool call, so it is not executed.
+			if streamed {
+				break
+			}
 			continue
 		}
 		if status == http.StatusTooManyRequests || status >= 500 {
@@ -225,6 +239,9 @@ func (c *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 		parsed, err := parseModelBody(raw)
 		if err != nil {
 			return Response{}, err
+		}
+		if !streamed && parsed.Text != "" && req.Display != nil {
+			req.Display(parsed.Text)
 		}
 		parsed.ModelName = c.Model
 		parsed.Attempts = posts
@@ -270,7 +287,7 @@ func (c *OpenAI) messages(req Request) ([]chatMessage, error) {
 	return out, nil
 }
 
-func (c *OpenAI) post(ctx context.Context, payload chatRequest) (int, []byte, error) {
+func (c *OpenAI) post(ctx context.Context, payload chatRequest, onText func(string)) (int, []byte, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, nil, err
@@ -295,11 +312,69 @@ func (c *OpenAI) post(ctx context.Context, payload chatRequest) (int, []byte, er
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	raw, err := readLimited(resp.Body, maxModelBody)
+	var raw []byte
+	// Error bodies are not shown. Text is emitted only while a successful stream is read.
+	if resp.StatusCode < 300 && payload.Stream {
+		raw, err = readStream(resp.Body, maxModelBody, onText)
+	} else {
+		raw, err = readLimited(resp.Body, maxModelBody)
+	}
 	if err != nil {
 		return resp.StatusCode, raw, err
 	}
 	return resp.StatusCode, raw, nil
+}
+
+// readStream keeps the 1 MiB cap and reports content deltas as they arrive.
+// Tool-call fragments are left for parseSSE, which accepts one call only after the body is complete.
+func readStream(r io.Reader, limit int, onText func(string)) ([]byte, error) {
+	br := bufio.NewReader(io.LimitReader(r, int64(limit)+1))
+	var raw bytes.Buffer
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			raw.Write(line)
+			if raw.Len() > limit {
+				return nil, fmt.Errorf("model response exceeded %d bytes", limit)
+			}
+			emitStreamText(string(line), onText)
+		}
+		if err == io.EOF {
+			return raw.Bytes(), nil
+		}
+		if err != nil {
+			return raw.Bytes(), err
+		}
+	}
+}
+
+func emitStreamText(line string, onText func(string)) {
+	if onText == nil {
+		return
+	}
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "data:") {
+		return
+	}
+	data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if data == "" || data == "[DONE]" || data[0] != '{' {
+		return
+	}
+	var chunk streamChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return
+	}
+	if len(chunk.Choices) == 0 {
+		return
+	}
+	choice := chunk.Choices[0]
+	text := choice.Delta.Content
+	if text == "" {
+		text = choice.Message.Content
+	}
+	if text != "" {
+		onText(text)
+	}
 }
 
 func readLimited(r io.Reader, limit int) ([]byte, error) {

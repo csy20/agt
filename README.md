@@ -62,12 +62,39 @@ Unix hosts pass the host uid and gid to Docker. Native Windows uses the unprivil
 
 On Linux the data directory stays `~/.local/share/agt` when `AGT_DATA_DIR` is unset, even if `XDG_DATA_HOME` is set. Config is `$XDG_CONFIG_HOME/agt` or `~/.config/agt`. Cache is `$XDG_CACHE_HOME/agt` or `~/.cache/agt`. A Darwin build uses `~/Library/Application Support/agt` and `~/Library/Caches/agt`. A Windows build uses `%AppData%\agt` and `%LocalAppData%\agt`. Those Darwin and Windows paths were not executed on this machine. `AGT_CONFIG_DIR` and `AGT_CACHE_DIR` override the config and cache directories. The daemon log is `$AGT_DATA_DIR/agtd.log`. `agtd` writes `agtd.pid` and `agtd.addr` while it is listening and removes them on a clean shutdown. A daemon started by `agt` keeps running after the client exits. `--model` checks the daemon's `AGT_MODEL_NAME` and does not call a hosted model. Attach reconnects from the last event it printed.
 
+## Interactive session
+
+On a terminal, `agt` with no arguments opens a session in the current repository. A pipe still prints usage. `agt tui --dump` prints example frames and does not start a run or change repository files. `agt tui --demo` is that same example inside the terminal.
+
+```sh
+agt tui --dump
+agt setup --repo . --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --confirm
+```
+
+The session shows assistant text as it arrives, collapsible tool lines, and an approval bound to the command's argument hash. `ctrl+y` and `ctrl+n` post that full hash. `y` and `n` do that only while the confirm line is focused. Text in the composer never approves or applies. The routine view abbreviates the hash and the digest. `ctrl+f` shows the full values, and the apply confirmation shows the full digest. `/diff` shows the preview. `/apply` posts that digest. Ctrl+C leaves the screen and restores the terminal. It does not cancel the run and does not apply a patch. A pipe refuses the session.
+
+`/plan` and `/ask` send interaction `plan` or `ask`. The daemon denies writes, test runs, and other mutations in those modes, including a create that does not come from this screen. They finish with the answer and do not require a failing baseline. The repair state `PLANNING` still executes. `/model` shows the daemon's `AGT_MODEL_NAME` and does not switch models. The status line labels the cent limit as an estimate. `@path` names a repository file. The file bytes are not copied into the goal. A follow-up `/fix` starts a new run from a fresh snapshot. An unapplied patch stays visible and unapplied until its digest is confirmed. The session says that patch's edits are absent from the new snapshot. Example scenes use the payrepo fixture and are not available in a live session.
+
+A session is stored apart from its runs and is bound to one canonical repository path. `agt session new` creates that record and does not start a run. `agt session list` lists sessions for the path. `agt session open` attaches when a run is still active and prints the ordered history when the session is idle. `agt session show` prints that history and does not attach. Open and show do not start work, replay a tool, or apply a patch. `agt session submit` stores one goal. Omit `--message-id` and the client prints a generated id before the request. Repeating that id returns the original run. A new prompt while a run is active is refused and does not change that run's goal. A session bound to one repository is not silently pointed at another. `/sessions` opens the same list inside the screen. Choosing a session reopens it. Choosing a new session clears the selection and does not create a run until a prompt is sent. The next run can carry bounded history and prior results as `DATA origin=session-history`. Facts that do not fit become `DATA origin=session-summary`. Repository content, summaries, and tool output stay in those tagged messages.
+
+```sh
+agt session new --repo .
+agt session list --repo .
+agt session show SESSION
+agt session open SESSION
+```
+
+`agt setup --confirm` saves the profile and the test command. It does not choose an image, start `agtd`, or start a run. Empty test argv is an error. Bubble Tea, Bubbles, and Lip Gloss draw the screen. `agt fix` and `--json` stay available for scripts.
+
 ## Layout
 
 | Path | Role |
 |---|---|
 | `cmd/agt` | CLI |
 | `cmd/agtd` | Control plane and worker |
+| `internal/tui` | Interactive session |
+| `internal/client` | Daemon client used by the session |
+| `internal/setup` | Confirmed profile and test command |
 | `internal/policy` | Allow, deny, or require approval |
 | `internal/sandbox` | Per-run Docker test execution |
 | `internal/profile` | Python, Go, and JavaScript execution profiles |

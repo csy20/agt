@@ -20,6 +20,7 @@ import (
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/model"
+	"github.com/csy20/agt/internal/policy"
 	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
@@ -59,6 +60,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/runs/{id}/budget-resume", s.budgetResume)
 	mux.HandleFunc("POST /v1/runs/{id}/cancel", s.cancel)
 	mux.HandleFunc("POST /v1/cleanup", s.cleanup)
+	mux.HandleFunc("POST /v1/sessions", s.createSession)
+	mux.HandleFunc("GET /v1/sessions", s.listSessions)
+	mux.HandleFunc("GET /v1/sessions/{id}", s.readSession)
+	mux.HandleFunc("POST /v1/sessions/{id}/open", s.openSession)
+	mux.HandleFunc("POST /v1/sessions/{id}/messages", s.submitSession)
 	return s.guard(mux)
 }
 
@@ -116,6 +122,9 @@ type createRequest struct {
 	Provider    string          `json:"provider"`
 	ScriptPath  string          `json:"script_path"`
 	Profile     json.RawMessage `json:"profile"`
+	// Interaction is agent, ask, or plan. Empty means agent.
+	// ask and plan are read-only. PLANNING remains the normal repair state.
+	Interaction string `json:"interaction"`
 }
 
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
@@ -124,140 +133,13 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "read body")
 		return
 	}
-	if imageField(body) {
-		writeError(w, http.StatusBadRequest, "image is not accepted; the daemon selects the profile image")
+	in, code, msg := s.prepareRun(body)
+	if code != 0 {
+		writeError(w, code, msg)
 		return
 	}
-	var req createRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	if strings.TrimSpace(req.Goal) == "" {
-		writeError(w, http.StatusBadRequest, "goal is required")
-		return
-	}
-	repo, err := filepath.Abs(req.RepoPath)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "repo_path")
-		return
-	}
-	info, err := os.Stat(repo)
-	if err != nil || !info.IsDir() {
-		writeError(w, http.StatusBadRequest, "repo_path is not a directory")
-		return
-	}
-	if s.Config.DataDir != "" {
-		if err := workspace.Overlap(repo, s.Config.DataDir); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	provider := req.Provider
-	if provider == "" {
-		provider = s.Config.Provider
-	}
-	if provider != "fake" && provider != "openai" {
-		writeError(w, http.StatusBadRequest, "provider must be fake or openai")
-		return
-	}
-	budget := 100
-	if req.BudgetCents != nil {
-		budget = *req.BudgetCents
-	}
-	if budget < 0 || budget > 100_000 {
-		writeError(w, http.StatusBadRequest, "budget_cents out of range")
-		return
-	}
-	maxSteps := 16
-	if req.MaxSteps != nil {
-		maxSteps = *req.MaxSteps
-	}
-	if maxSteps < 0 || maxSteps > 100 {
-		writeError(w, http.StatusBadRequest, "max_steps out of range")
-		return
-	}
-	wall := 300
-	if req.WallSeconds != nil {
-		wall = *req.WallSeconds
-	}
-	if wall <= 0 || wall > 3600 {
-		writeError(w, http.StatusBadRequest, "wall_seconds out of range")
-		return
-	}
-	var script json.RawMessage
-	scriptPath := ""
-	if provider == "fake" {
-		if req.ScriptPath == "" {
-			writeError(w, http.StatusBadRequest, "fake provider requires script_path")
-			return
-		}
-		scriptPath, err = filepath.Abs(req.ScriptPath)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "script_path")
-			return
-		}
-		st, err := os.Lstat(scriptPath)
-		if err != nil || !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
-			writeError(w, http.StatusBadRequest, "script_path must be a regular file")
-			return
-		}
-		if st.Size() > 1<<20 {
-			writeError(w, http.StatusBadRequest, "script_path is too large")
-			return
-		}
-		raw, err := os.ReadFile(scriptPath)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "script_path unreadable")
-			return
-		}
-		parsed, err := model.ParseScript(raw)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "script is invalid: "+err.Error())
-			return
-		}
-		encoded, err := json.Marshal(parsed)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "script is invalid")
-			return
-		}
-		script = encoded
-	}
-	if provider == "openai" && (s.Config.ModelName == "" || (s.Config.ModelAPIKey == "" && !model.LoopbackURL(s.Config.ModelBaseURL))) {
-		writeError(w, http.StatusBadRequest, "AGT_MODEL_NAME is required for the openai provider. AGT_MODEL_API_KEY is required unless AGT_MODEL_BASE_URL is a loopback URL")
-		return
-	}
-	profReq, err := decodeProfile(req.Profile)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	images := s.Config.ProfileImages()
-	resolved, err := profile.Resolve(profReq, images, runtime.GOARCH)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	profileJSON, err := resolved.Canonical()
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "profile")
-		return
-	}
-	hash := requestHash(req.Goal, repo, budget, maxSteps, wall, provider, script, profileJSON)
-	created, isNew, err := s.Store.CreateRun(r.Context(), store.CreateInput{
-		IdempotencyKey: r.Header.Get("Idempotency-Key"),
-		RequestHash:    hash,
-		Goal:           req.Goal,
-		RepoPath:       repo,
-		BudgetCents:    budget,
-		MaxSteps:       maxSteps,
-		WallSeconds:    wall,
-		AgentVersion:   version.Compute(images.Python, images.Go, images.Node),
-		Provider:       provider,
-		ScriptPath:     scriptPath,
-		ScriptJSON:     script,
-		ProfileJSON:    profileJSON,
-	})
+	in.IdempotencyKey = r.Header.Get("Idempotency-Key")
+	created, isNew, err := s.Store.CreateRun(r.Context(), in)
 	if errors.Is(err, store.ErrIdempotency) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -276,6 +158,128 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		"events_url": "/v1/runs/" + created.ID + "/events",
 		"created":    isNew,
 	})
+}
+
+// prepareRun validates a create body. A zero status means the input is ready.
+// Idempotency and session linkage are applied by the caller.
+func (s *Server) prepareRun(body []byte) (store.CreateInput, int, string) {
+	if imageField(body) {
+		return store.CreateInput{}, http.StatusBadRequest, "image is not accepted; the daemon selects the profile image"
+	}
+	var req createRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return store.CreateInput{}, http.StatusBadRequest, "invalid JSON"
+	}
+	if strings.TrimSpace(req.Goal) == "" {
+		return store.CreateInput{}, http.StatusBadRequest, "goal is required"
+	}
+	repo, err := filepath.Abs(req.RepoPath)
+	if err != nil {
+		return store.CreateInput{}, http.StatusBadRequest, "repo_path"
+	}
+	info, err := os.Stat(repo)
+	if err != nil || !info.IsDir() {
+		return store.CreateInput{}, http.StatusBadRequest, "repo_path is not a directory"
+	}
+	if s.Config.DataDir != "" {
+		if err := workspace.Overlap(repo, s.Config.DataDir); err != nil {
+			return store.CreateInput{}, http.StatusBadRequest, err.Error()
+		}
+	}
+	provider := req.Provider
+	if provider == "" {
+		provider = s.Config.Provider
+	}
+	if provider != "fake" && provider != "openai" {
+		return store.CreateInput{}, http.StatusBadRequest, "provider must be fake or openai"
+	}
+	budget := 100
+	if req.BudgetCents != nil {
+		budget = *req.BudgetCents
+	}
+	if budget < 0 || budget > 100_000 {
+		return store.CreateInput{}, http.StatusBadRequest, "budget_cents out of range"
+	}
+	maxSteps := 16
+	if req.MaxSteps != nil {
+		maxSteps = *req.MaxSteps
+	}
+	if maxSteps < 0 || maxSteps > 100 {
+		return store.CreateInput{}, http.StatusBadRequest, "max_steps out of range"
+	}
+	wall := 300
+	if req.WallSeconds != nil {
+		wall = *req.WallSeconds
+	}
+	if wall <= 0 || wall > 3600 {
+		return store.CreateInput{}, http.StatusBadRequest, "wall_seconds out of range"
+	}
+	var script json.RawMessage
+	scriptPath := ""
+	if provider == "fake" {
+		if req.ScriptPath == "" {
+			return store.CreateInput{}, http.StatusBadRequest, "fake provider requires script_path"
+		}
+		scriptPath, err = filepath.Abs(req.ScriptPath)
+		if err != nil {
+			return store.CreateInput{}, http.StatusBadRequest, "script_path"
+		}
+		st, err := os.Lstat(scriptPath)
+		if err != nil || !st.Mode().IsRegular() || st.Mode()&os.ModeSymlink != 0 {
+			return store.CreateInput{}, http.StatusBadRequest, "script_path must be a regular file"
+		}
+		if st.Size() > 1<<20 {
+			return store.CreateInput{}, http.StatusBadRequest, "script_path is too large"
+		}
+		raw, err := os.ReadFile(scriptPath)
+		if err != nil {
+			return store.CreateInput{}, http.StatusBadRequest, "script_path unreadable"
+		}
+		parsed, err := model.ParseScript(raw)
+		if err != nil {
+			return store.CreateInput{}, http.StatusBadRequest, "script is invalid: " + err.Error()
+		}
+		encoded, err := json.Marshal(parsed)
+		if err != nil {
+			return store.CreateInput{}, http.StatusBadRequest, "script is invalid"
+		}
+		script = encoded
+	}
+	if provider == "openai" && (s.Config.ModelName == "" || (s.Config.ModelAPIKey == "" && !model.LoopbackURL(s.Config.ModelBaseURL))) {
+		return store.CreateInput{}, http.StatusBadRequest, "AGT_MODEL_NAME is required for the openai provider. AGT_MODEL_API_KEY is required unless AGT_MODEL_BASE_URL is a loopback URL"
+	}
+	profReq, err := decodeProfile(req.Profile)
+	if err != nil {
+		return store.CreateInput{}, http.StatusBadRequest, err.Error()
+	}
+	images := s.Config.ProfileImages()
+	resolved, err := profile.Resolve(profReq, images, runtime.GOARCH)
+	if err != nil {
+		return store.CreateInput{}, http.StatusBadRequest, err.Error()
+	}
+	profileJSON, err := resolved.Canonical()
+	if err != nil {
+		return store.CreateInput{}, http.StatusBadRequest, "profile"
+	}
+	interaction := policy.NormalizeInteraction(req.Interaction)
+	if !policy.ValidInteraction(interaction) {
+		return store.CreateInput{}, http.StatusBadRequest, "interaction must be agent, ask, or plan"
+	}
+	hash := requestHash(req.Goal, repo, budget, maxSteps, wall, provider, script, profileJSON, interaction)
+	return store.CreateInput{
+		RequestHash:  hash,
+		Goal:         req.Goal,
+		RepoPath:     repo,
+		BudgetCents:  budget,
+		MaxSteps:     maxSteps,
+		WallSeconds:  wall,
+		AgentVersion: version.Compute(images.Python, images.Go, images.Node),
+		Provider:     provider,
+		ScriptPath:   scriptPath,
+		ScriptJSON:   script,
+		ProfileJSON:  profileJSON,
+		Interaction:  interaction,
+	}, 0, ""
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
@@ -454,9 +458,9 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
-func requestHash(goal, repo string, budget, steps, wall int, provider string, script, profileJSON []byte) string {
+func requestHash(goal, repo string, budget, steps, wall int, provider string, script, profileJSON []byte, interaction string) string {
 	sum := sha256.New()
-	fmt.Fprintf(sum, "%s\n%s\n%d\n%d\n%d\n%s\n", goal, repo, budget, steps, wall, provider)
+	fmt.Fprintf(sum, "%s\n%s\n%d\n%d\n%d\n%s\n%s\n", goal, repo, budget, steps, wall, provider, interaction)
 	sum.Write(script)
 	sum.Write([]byte("\n"))
 	sum.Write(profileJSON)
@@ -515,6 +519,8 @@ type runViewBody struct {
 	MaxSteps     int             `json:"max_steps"`
 	UsageMicros  int64           `json:"usage_micros"`
 	Error        string          `json:"error,omitempty"`
+	Interaction  string          `json:"interaction,omitempty"`
+	SessionID    string          `json:"session_id,omitempty"`
 	Plan         json.RawMessage `json:"plan,omitempty"`
 	Result       json.RawMessage `json:"result,omitempty"`
 	Profile      json.RawMessage `json:"profile,omitempty"`
@@ -538,7 +544,8 @@ func runView(current store.Run) runViewBody {
 		State: current.State, StateVersion: current.StateVersion, BudgetCents: current.BudgetCents,
 		SpentMicros: current.SpentMicros, AgentVersion: current.AgentVersion, TraceID: current.TraceID,
 		Provider: current.Provider, StepCount: current.StepCount, MaxSteps: current.MaxSteps,
-		Error: current.Error, CreatedAt: current.CreatedAt, UpdatedAt: current.UpdatedAt,
+		Error: current.Error, Interaction: current.Interaction, SessionID: current.SessionID,
+		CreatedAt: current.CreatedAt, UpdatedAt: current.UpdatedAt,
 	}
 	if len(current.Plan) > 0 && string(current.Plan) != "null" {
 		view.Plan = current.Plan

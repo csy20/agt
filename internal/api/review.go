@@ -117,6 +117,7 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 		"files":     len(art.Files),
 		"rollback":  rollback,
 	})
+	_ = s.Store.RecordApplied(r.Context(), current, art.Digest)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"applied":   len(art.Files),
 		"digest":    art.Digest,
