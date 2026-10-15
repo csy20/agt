@@ -1,10 +1,9 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,12 +15,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/csy20/agt/internal/usage"
+	"github.com/csy20/agt/internal/auth"
+	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/version"
 )
 
 func Run(args []string) int {
 	if len(args) < 2 {
+		if terminalSession() {
+			return tuiCmd(nil)
+		}
 		usageText()
 		return 2
 	}
@@ -31,10 +34,22 @@ func Run(args []string) int {
 		return 0
 	case "fix":
 		return fix(args[2:])
+	case "profile":
+		return profileCommand(args[2:])
 	case "approve":
 		return approve(args[2:])
 	case "run":
 		return runCmd(args[2:])
+	case "doctor":
+		return doctor(args[2:])
+	case "tui":
+		return tuiCmd(args[2:])
+	case "session":
+		return sessionCmd(args[2:])
+	case "setup":
+		return setupCmd(args[2:])
+	case "completion":
+		return completion(args[2:])
 	case "help", "-h", "--help":
 		usageText()
 		return 0
@@ -48,50 +63,102 @@ func Run(args []string) int {
 func usageText() {
 	fmt.Fprint(os.Stderr, `agt is a durable coding-agent terminal.
 
-  agt fix --repo PATH [--provider fake|openai] [--script FILE] "goal"
-  agt run create --goal TEXT --repo PATH
-  agt run status RUN
-  agt run attach RUN
+  agt fix --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE "goal"
+  agt fix --repo PATH --profile go --test-arg go --test-arg test --test-arg ./... "goal"
+  agt profile detect --repo PATH
+  agt run create --goal TEXT --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE
+  agt run list [--limit N] [--json]
+  agt run status RUN [--json]
+  agt run attach RUN [--json]
+  agt run diff RUN
+  agt run export RUN --output FILE
+  agt run apply RUN --digest DIGEST
+  agt run pause RUN
+  agt run resume RUN
+  agt run budget-resume RUN [--budget-cents N]
+  agt run cancel RUN
+  agt run cleanup
   agt approve RUN COMMAND --args-hash HASH
+  agt doctor [--json]
+  agt setup --repo PATH --profile NAME --test-arg ARG --confirm
+  agt tui [--demo] [--dump] [--repo PATH] [--session ID]
+  agt session list [--repo PATH]
+  agt session new [--repo PATH]
+  agt session open SESSION [--repo PATH]
+  agt session show SESSION [--repo PATH]
+  agt session submit SESSION --goal TEXT --repo PATH --profile NAME --message-id ID
+  agt completion bash|zsh|fish|powershell
   agt version
 
-The control plane is agtd. agt starts it when the binary sits beside agt and nothing is listening.
+With no command, a terminal opens the session. A pipe still prints this usage.
+agt session open attaches to an active run and only prints history when the session is idle. Neither starts work or applies a patch.
+A repeated --message-id returns the original run. A new prompt while a run is active is refused and does not change that run's goal.
+agt tui --dump prints an example session. It does not start a run or change a repository.
+agt setup writes a profile and a test command after --confirm. It does not choose an image or start a run.
+/plan and /ask inside the session are read-only. The repair state PLANNING still executes.
+--profile is required for agt fix. --repo does not select a language or a test command.
+agt profile detect prints a suggestion and does not start a run.
+--provider defaults to AGT_PROVIDER. --model checks AGT_MODEL_NAME on agtd and does not call a hosted model.
+The fake provider is a labelled scripted demo, not a live model.
+The control plane is agtd. agt starts it when that binary sits beside agt and the daemon identity matches this client.
+agt sends the local token from AGT_TOKEN or $AGT_DATA_DIR/auth.token. GET /healthz and GET /v1/identity do not use the token.
+agt run diff and agt run export review the snapshot. agt run apply writes the source repository only after --digest matches that artifact.
+Leaving agt run attach, including Ctrl+C, does not cancel the run and does not apply the change. agt run cancel does.
+A dollar cap is not enforced when model prices are zero or the provider reports no usage.
+Set NO_COLOR to keep the progress lines plain. --json prints machine-readable output.
+agt doctor names the next command when Docker, Postgres, the token, the listen address, the images, or the daemon version fail.
 `)
 }
 
 func fix(args []string) int {
 	fs := flag.NewFlagSet("fix", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	repo := fs.String("repo", "", "repository to copy into a run worktree")
-	provider := fs.String("provider", "fake", "fake or openai")
-	script := fs.String("script", "", "fake-provider script JSON")
+	repoFlag := fs.String("repo", "", "repository to copy into a run worktree")
+	providerFlag := fs.String("provider", "", "fake or openai; defaults to AGT_PROVIDER")
+	scriptFlag := fs.String("script", "", "fake-provider script JSON")
 	budget := fs.Int("budget-cents", 100, "run budget in cents")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(args); err != nil {
+	modelFlag := fs.String("model", "", "require this AGT_MODEL_NAME on agtd")
+	asJSON := fs.Bool("json", false, "print events as JSON")
+	pf := addProfileFlags(fs)
+	if err := fs.Parse(reorderFlags(args, runValueFlags(true))); err != nil {
 		return 2
 	}
 	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
-	if goal == "" || *repo == "" {
+	if goal == "" || *repoFlag == "" {
 		fmt.Fprintln(os.Stderr, "fix requires a goal and --repo")
 		return 2
 	}
-	if *provider == "fake" && *script == "" {
-		cand := filepath.Join("eval", "scripts", "fix_retry.json")
-		if _, err := os.Stat(cand); err == nil {
-			abs, _ := filepath.Abs(cand)
-			*script = abs
+	prof, err := pf.request()
+	if err != nil {
+		if errors.Is(err, errProfileRequired) {
+			fmt.Fprintln(os.Stderr, "fix requires --profile. Passing --repo does not select a language or a test command.")
+			printSuggestion(*repoFlag)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
 		}
+		return 2
+	}
+	provider, repo, script, err := runInputs(*providerFlag, *repoFlag, *scriptFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
 	}
 	base, err := ensureServer(*server)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	body := map[string]any{
-		"goal": goal, "repo_path": *repo, "provider": *provider, "budget_cents": *budget,
+	if err := matchModel(base, *modelFlag); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
 	}
-	if *script != "" {
-		body["script_path"] = *script
+	body := map[string]any{
+		"goal": goal, "repo_path": repo, "provider": provider, "budget_cents": *budget,
+		"profile": profilePayload(prof),
+	}
+	if script != "" {
+		body["script_path"] = script
 	}
 	var created struct {
 		RunID string `json:"run_id"`
@@ -107,7 +174,7 @@ func fix(args []string) int {
 		return 1
 	}
 	fmt.Printf("run %s\n", created.RunID)
-	return attach(base, created.RunID)
+	return attach(base, created.RunID, *asJSON)
 }
 
 func runCmd(args []string) int {
@@ -118,28 +185,28 @@ func runCmd(args []string) int {
 	switch args[0] {
 	case "create":
 		return create(args[1:])
+	case "list":
+		return listCmd(args[1:])
 	case "status":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: agt run status RUN")
-			return 2
-		}
-		base, err := ensureServer("")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return printStatus(base, args[1])
+		return statusCmd(args[1:])
 	case "attach":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: agt run attach RUN")
-			return 2
-		}
-		base, err := ensureServer("")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return attach(base, args[1])
+		return attachCmd(args[1:])
+	case "diff":
+		return diffCmd(args[1:])
+	case "export":
+		return exportCmd(args[1:])
+	case "apply":
+		return applyCmd(args[1:])
+	case "pause":
+		return lifecycleCmd("pause", args[1:])
+	case "resume":
+		return lifecycleCmd("resume", args[1:])
+	case "budget-resume":
+		return budgetResumeCmd(args[1:])
+	case "cancel":
+		return lifecycleCmd("cancel", args[1:])
+	case "cleanup":
+		return lifecycleCmd("cleanup", args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown run command %q\n", args[0])
 		return 2
@@ -150,15 +217,32 @@ func create(args []string) int {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	goal := fs.String("goal", "", "run goal")
-	repo := fs.String("repo", "", "repository path")
-	provider := fs.String("provider", "fake", "fake or openai")
-	script := fs.String("script", "", "fake-provider script")
+	repoFlag := fs.String("repo", "", "repository path")
+	providerFlag := fs.String("provider", "", "fake or openai; defaults to AGT_PROVIDER")
+	scriptFlag := fs.String("script", "", "fake-provider script")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(args); err != nil {
+	modelFlag := fs.String("model", "", "require this AGT_MODEL_NAME on agtd")
+	pf := addProfileFlags(fs)
+	if err := fs.Parse(reorderFlags(args, runValueFlags(false))); err != nil {
 		return 2
 	}
-	if *goal == "" || *repo == "" {
+	if *goal == "" || *repoFlag == "" {
 		fmt.Fprintln(os.Stderr, "create requires --goal and --repo")
+		return 2
+	}
+	prof, err := pf.request()
+	if err != nil {
+		if errors.Is(err, errProfileRequired) {
+			fmt.Fprintln(os.Stderr, "create requires --profile. Passing --repo does not select a language or a test command.")
+			printSuggestion(*repoFlag)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		return 2
+	}
+	provider, repo, script, err := runInputs(*providerFlag, *repoFlag, *scriptFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	base, err := ensureServer(*server)
@@ -166,9 +250,16 @@ func create(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	body := map[string]any{"goal": *goal, "repo_path": *repo, "provider": *provider}
-	if *script != "" {
-		body["script_path"] = *script
+	if err := matchModel(base, *modelFlag); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	body := map[string]any{
+		"goal": *goal, "repo_path": repo, "provider": provider,
+		"profile": profilePayload(prof),
+	}
+	if script != "" {
+		body["script_path"] = script
 	}
 	var created struct {
 		RunID string `json:"run_id"`
@@ -194,7 +285,9 @@ func approve(args []string) int {
 	yes := fs.Bool("yes", false, "approve the command currently stored for this id")
 	decision := fs.String("decision", "approved", "approved or rejected")
 	server := fs.String("server", "", "agtd base URL")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{
+		"args-hash": true, "decision": true, "server": true,
+	})); err != nil {
 		return 2
 	}
 	rest := fs.Args()
@@ -243,19 +336,13 @@ func approve(args []string) int {
 	return 0
 }
 
-func printStatus(base, runID string) int {
-	var view map[string]any
-	if err := getJSON(base+"/v1/runs/"+runID, &view); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+func terminalSession() bool {
+	out, err := os.Stdout.Stat()
+	if err != nil || out.Mode()&os.ModeCharDevice == 0 {
+		return false
 	}
-	fmt.Printf("state %v\n", view["state"])
-	if n, ok := asInt64(view["usage_micros"]); ok {
-		fmt.Printf("usage %s\n", usage.USD(n))
-	}
-	raw, _ := json.MarshalIndent(view, "", "  ")
-	fmt.Println(string(raw))
-	return 0
+	in, err := os.Stdin.Stat()
+	return err == nil && in.Mode()&os.ModeCharDevice != 0
 }
 
 func asInt64(v any) (int64, bool) {
@@ -275,81 +362,6 @@ func asInt64(v any) (int64, bool) {
 	}
 }
 
-func attach(base, runID string) int {
-	req, err := http.NewRequest(http.MethodGet, base+"/v1/runs/"+runID+"/events?stream=1&after=0", nil)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "events: %s\n", strings.TrimSpace(string(body)))
-		return 1
-	}
-	if err := readSSE(resp.Body, func(event string, data []byte) {
-		if line := formatEvent(event, data); line != "" {
-			fmt.Println(line)
-		}
-	}); err != nil && !errorsIsEOF(err) {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	var view struct {
-		State       string          `json:"state"`
-		SpentMicros int64           `json:"spent_micros"`
-		Worktree    string          `json:"worktree"`
-		Error       string          `json:"error"`
-		Result      json.RawMessage `json:"result"`
-	}
-	if err := getJSON(base+"/v1/runs/"+runID, &view); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if len(view.Result) > 0 && string(view.Result) != "null" {
-		var result struct {
-			Summary string `json:"summary"`
-			Diff    string `json:"diff"`
-			Tests   struct {
-				Passed bool   `json:"passed"`
-				Output string `json:"output"`
-			} `json:"tests"`
-		}
-		_ = json.Unmarshal(view.Result, &result)
-		fmt.Printf("\n%s\ncost %s\n", result.Summary, usage.USD(view.SpentMicros))
-		if result.Diff != "" {
-			fmt.Printf("\n%s", result.Diff)
-			if !strings.HasSuffix(result.Diff, "\n") {
-				fmt.Println()
-			}
-		}
-	} else {
-		fmt.Printf("state %s\ncost %s\n", view.State, usage.USD(view.SpentMicros))
-	}
-	if view.Worktree != "" {
-		fmt.Printf("worktree %s\n", view.Worktree)
-	}
-	switch view.State {
-	case "SUCCEEDED":
-		return 0
-	case "AWAITING_APPROVAL":
-		fmt.Fprintln(os.Stderr, "approval required: agt approve "+runID+" COMMAND --args-hash HASH")
-		return 3
-	case "PAUSED_BUDGET":
-		return 4
-	default:
-		if view.Error != "" {
-			fmt.Fprintln(os.Stderr, view.Error)
-		}
-		return 1
-	}
-}
-
 func formatEvent(event string, data []byte) string {
 	var payload map[string]any
 	_ = json.Unmarshal(data, &payload)
@@ -359,124 +371,90 @@ func formatEvent(event string, data []byte) string {
 	case "plan.updated":
 		return "plan updated"
 	case "command.finished":
-		return fmt.Sprintf("tool %v exit %v", payload["tool"], payload["exit_code"])
+		line := fmt.Sprintf("tool %v exit %v", payload["tool"], payload["exit_code"])
+		if excerpt := oneLine(payload["output_excerpt"], 120); excerpt != "" {
+			line += " " + excerpt
+		}
+		return line
 	case "command.started":
 		return fmt.Sprintf("tool %v started", payload["tool"])
 	case "approval.requested":
 		return fmt.Sprintf("approval required %v %v hash %v", payload["tool"], payload["command_id"], payload["args_hash"])
 	case "approval.recorded":
 		return fmt.Sprintf("approval %v", payload["decision"])
+	case "assistant.delta":
+		text, _ := payload["text"].(string)
+		return text
 	case "budget.paused":
 		return "paused: budget"
 	case "run.succeeded":
 		return "succeeded"
 	case "run.failed":
 		return fmt.Sprintf("failed: %v", payload["reason"])
+	case "workspace.captured":
+		return fmt.Sprintf("workspace captured %v %v", payload["strategy"], payload["revision"])
+	case "patch.applied":
+		return fmt.Sprintf("applied %v files digest %v", payload["files"], payload["digest"])
+	case "verification.failed":
+		return fmt.Sprintf("verification failed exit %v outcome %v", payload["exit_code"], payload["outcome"])
+	case "baseline.recorded":
+		return fmt.Sprintf("baseline exit %v", payload["exit_code"])
 	default:
 		return ""
 	}
 }
 
-func readSSE(r io.Reader, fn func(event string, data []byte)) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 2<<20)
-	var event string
-	var data bytes.Buffer
-	flush := func() {
-		if event == "" && data.Len() == 0 {
-			return
-		}
-		name := event
-		if name == "" {
-			name = "message"
-		}
-		fn(name, append([]byte(nil), data.Bytes()...))
-		event = ""
-		data.Reset()
+func oneLine(v any, n int) string {
+	if v == nil {
+		return ""
 	}
-	for sc.Scan() {
-		line := sc.Text()
-		if line == "" {
-			flush()
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			if data.Len() > 0 {
-				data.WriteByte('\n')
-			}
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
+	s := strings.TrimSpace(fmt.Sprint(v))
+	if s == "" || s == "<nil>" {
+		return ""
 	}
-	flush()
-	if err := sc.Err(); err != nil {
-		return err
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > n {
+		s = s[:n] + "..."
 	}
-	return io.EOF
+	return s
 }
 
-func ensureServer(explicit string) (string, error) {
-	base := explicit
-	if base == "" {
-		base = os.Getenv("AGT_URL")
+func startDaemon(bin string) (*exec.Cmd, string, error) {
+	dataDir := config.Load().DataDir
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return nil, "", fmt.Errorf("create data dir %s: %w", dataDir, err)
 	}
-	if base == "" {
-		base = "http://127.0.0.1:8787"
-	}
-	base = strings.TrimRight(base, "/")
-	if health(base) == nil {
-		return base, nil
-	}
-	if explicit != "" || os.Getenv("AGT_URL") != "" {
-		return "", fmt.Errorf("agtd is not healthy at %s", base)
-	}
-	bin := os.Getenv("AGTD_BIN")
-	if bin == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return "", fmt.Errorf("agtd is not running at %s", base)
-		}
-		bin = filepath.Join(filepath.Dir(exe), "agtd")
-	}
-	if _, err := os.Stat(bin); err != nil {
-		return "", fmt.Errorf("agtd is not running at %s and %s was not found", base, bin)
+	logPath := filepath.Join(dataDir, "agtd.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, "", fmt.Errorf("open daemon log %s: %w", logPath, err)
 	}
 	cmd := exec.Command(bin)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	detachDaemon(cmd)
 	if err := cmd.Start(); err != nil {
-		return "", err
+		logFile.Close()
+		return nil, "", fmt.Errorf("start %s: %w", bin, err)
 	}
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		if health(base) == nil {
-			fmt.Fprintf(os.Stderr, "started agtd pid %d\n", cmd.Process.Pid)
-			return base, nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return "", fmt.Errorf("agtd pid %d did not become healthy", cmd.Process.Pid)
+	logFile.Close()
+	return cmd, logPath, nil
 }
 
-func health(base string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/healthz", nil)
+func runInputs(providerFlag, repoFlag, scriptFlag string) (provider, repo, script string, err error) {
+	provider, err = resolveProvider(providerFlag)
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	repo, err = absolutePath(repoFlag)
 	if err != nil {
-		return err
+		return "", "", "", err
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("health %d", resp.StatusCode)
+	script, err = prepareFakeScript(provider, scriptFlag)
+	if err != nil {
+		return "", "", "", err
 	}
-	return nil
+	return provider, repo, script, nil
 }
 
 func postJSON(url string, body any, dest any) error {
@@ -490,6 +468,9 @@ func postJSON(url string, body any, dest any) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", "idem_"+strconv.FormatInt(time.Now().UnixNano(), 36))
+	if err := setAuth(req); err != nil {
+		return err
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -516,7 +497,14 @@ func postJSON(url string, body any, dest any) error {
 }
 
 func getJSON(url string, dest any) error {
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if err := setAuth(req); err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -531,6 +519,12 @@ func getJSON(url string, dest any) error {
 	return json.Unmarshal(data, dest)
 }
 
-func errorsIsEOF(err error) bool {
-	return err == io.EOF
+func setAuth(req *http.Request) error {
+	dir := config.Load().DataDir
+	token, err := auth.Read(dir)
+	if err != nil {
+		return fmt.Errorf("local API token: %w. Set the same AGT_DATA_DIR or AGT_TOKEN as agtd", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	return nil
 }

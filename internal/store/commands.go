@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
+	"github.com/csy20/agt/internal/profile"
+	"github.com/csy20/agt/internal/redact"
 	"github.com/csy20/agt/internal/run"
 	"github.com/jackc/pgx/v5"
 )
@@ -35,10 +38,13 @@ type Intent struct {
 	Reason       string
 	CommandID    string
 	Text         string
+	ToolCallID   string
+	ModelName    string
 	InputTokens  int
 	OutputTokens int
 	CostMicros   int64
 	Model        string
+	Attempts     int
 }
 
 type Approval struct {
@@ -53,6 +59,16 @@ type Approval struct {
 type Job struct {
 	ID    int64
 	RunID string
+	Fence int64
+}
+
+// Usage is one persisted cost or count row.
+type Usage struct {
+	Kind        string
+	Quantity    int64
+	CostMicros  int64
+	ModelName   string
+	ProfileName string
 }
 
 func (s *Store) CommitModelIntent(ctx context.Context, runID string, fromVersion int64, in Intent) (Run, error) {
@@ -93,16 +109,24 @@ func (s *Store) CommitModelIntent(ctx context.Context, runID string, fromVersion
 		if next != cur.State && !run.Can(cur.State, next) {
 			return fmt.Errorf("illegal transition %s -> %s", cur.State, next)
 		}
-		if err := insertUsage(ctx, tx, runID, "model.call", int64(in.InputTokens+in.OutputTokens), in.CostMicros); err != nil {
+		// The provider label is not a model name. An empty configured name stays empty.
+		modelName := in.ModelName
+		profName := profileName(cur.ProfileJSON)
+		if err := insertUsage(ctx, tx, runID, "model.call", int64(in.InputTokens+in.OutputTokens), in.CostMicros, modelName, profName); err != nil {
 			return err
 		}
 		if in.InputTokens > 0 {
-			if err := insertUsage(ctx, tx, runID, "model.input_tokens", int64(in.InputTokens), 0); err != nil {
+			if err := insertUsage(ctx, tx, runID, "model.input_tokens", int64(in.InputTokens), 0, modelName, profName); err != nil {
 				return err
 			}
 		}
 		if in.OutputTokens > 0 {
-			if err := insertUsage(ctx, tx, runID, "model.output_tokens", int64(in.OutputTokens), 0); err != nil {
+			if err := insertUsage(ctx, tx, runID, "model.output_tokens", int64(in.OutputTokens), 0, modelName, profName); err != nil {
+				return err
+			}
+		}
+		if in.Attempts > 1 {
+			if err := insertUsage(ctx, tx, runID, "model.http_attempts", int64(in.Attempts), 0, modelName, profName); err != nil {
 				return err
 			}
 		}
@@ -119,7 +143,11 @@ func (s *Store) CommitModelIntent(ctx context.Context, runID string, fromVersion
 		if _, err := appendEvent(ctx, tx, runID, "model.called", "model", nonempty(in.Model, "model"), map[string]any{
 			"kind": in.Kind, "tool": in.Tool, "input_tokens": in.InputTokens,
 			"output_tokens": in.OutputTokens, "cost_micros": in.CostMicros, "text": in.Text,
+			"model_name": in.ModelName, "tool_call_id": in.ToolCallID,
 		}); err != nil {
+			return err
+		}
+		if err := appendAssistantMessage(ctx, tx, runID, in); err != nil {
 			return err
 		}
 		if in.Kind == "tool" {
@@ -184,7 +212,10 @@ func insertIntentCommand(ctx context.Context, tx pgx.Tx, runID string, in Intent
 		result = string(body)
 		eventType = "command.finished"
 		payload["exit_code"] = 2
-		payload["output_excerpt"] = clip(in.Reason, 500)
+		payload["output_excerpt"] = clip(redact.Text(in.Reason), 500)
+		if err := appendToolMessage(ctx, tx, runID, in.ToolCallID, in.Tool, in.Reason, 2); err != nil {
+			return err
+		}
 	case "require_approval":
 		state = "awaiting_approval"
 		eventType = "approval.requested"
@@ -241,17 +272,91 @@ func (s *Store) FinishCommand(ctx context.Context, commandID, state string, resu
 	if err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE commands
-		SET state=$2, result=$3::jsonb, updated_at=now()
-		WHERE command_id=$1 AND state IN ('pending', 'approved')`, commandID, state, string(body))
+	var parsed struct {
+		ExitCode int    `json:"exit_code"`
+		Output   string `json:"output"`
+	}
+	_ = json.Unmarshal(body, &parsed)
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		var runID, tool string
+		err := tx.QueryRow(ctx, `SELECT run_id, tool FROM commands WHERE command_id=$1`, commandID).Scan(&runID, &tool)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		cur, err := lockRun(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE commands
+			SET state=$2, result=$3::jsonb, updated_at=now()
+			WHERE command_id=$1 AND state IN ('pending', 'approved')`, commandID, state, string(body))
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		if tool == "run_test" {
+			if err := insertUsage(ctx, tx, runID, "sandbox.test_runs", 1, 0, "", profileName(cur.ProfileJSON)); err != nil {
+				return err
+			}
+		}
+		return appendToolResult(ctx, tx, runID, tool, parsed.Output, parsed.ExitCode)
+	})
+}
+
+func appendAssistantMessage(ctx context.Context, tx pgx.Tx, runID string, in Intent) error {
+	msg := TranscriptMessage{Role: "assistant", Content: in.Text}
+	if in.Kind == "tool" {
+		args := string(in.Canonical)
+		if args == "" {
+			args = "{}"
+		}
+		msg.ToolCallID = in.ToolCallID
+		msg.ToolName = in.Tool
+		msg.Arguments = args
+	}
+	return appendTranscript(ctx, tx, runID, msg)
+}
+
+func appendToolResult(ctx context.Context, tx pgx.Tx, runID, tool, output string, exitCode int) error {
+	var id, name string
+	err := tx.QueryRow(ctx, `
+		SELECT tool_call_id, tool_name FROM model_messages
+		WHERE run_id=$1 AND role='assistant' AND tool_call_id <> ''
+		  AND NOT EXISTS (
+		    SELECT 1 FROM model_messages later
+		    WHERE later.run_id=model_messages.run_id AND later.role='tool' AND later.tool_call_id=model_messages.tool_call_id
+		  )
+		ORDER BY seq DESC
+		LIMIT 1`, runID).Scan(&id, &name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return ErrConflict
+	if name != "" && tool != "" && name != tool {
+		return fmt.Errorf("pending tool call %s does not match %s", name, tool)
 	}
-	return nil
+	return appendToolMessage(ctx, tx, runID, id, name, output, exitCode)
+}
+
+func appendToolMessage(ctx context.Context, tx pgx.Tx, runID, toolCallID, tool, output string, exitCode int) error {
+	if toolCallID == "" {
+		return nil
+	}
+	content := "DATA origin=tool:" + tool + "\nexit=" + strconv.Itoa(exitCode) + "\n" + clip(redact.Text(output), 4000)
+	return appendTranscript(ctx, tx, runID, TranscriptMessage{
+		Role:       "tool",
+		Content:    content,
+		ToolCallID: toolCallID,
+		ToolName:   tool,
+	})
 }
 
 func (s *Store) RecordSystemCommand(ctx context.Context, runID, commandID, tool, argsHash string, canonical []byte, output string, exitCode int) error {
@@ -260,7 +365,8 @@ func (s *Store) RecordSystemCommand(ctx context.Context, runID, commandID, tool,
 		return err
 	}
 	return s.withTx(ctx, func(tx pgx.Tx) error {
-		if _, err := lockRun(ctx, tx, runID); err != nil {
+		cur, err := lockRun(ctx, tx, runID)
+		if err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -271,12 +377,12 @@ func (s *Store) RecordSystemCommand(ctx context.Context, runID, commandID, tool,
 		); err != nil {
 			return err
 		}
-		if err := insertUsage(ctx, tx, runID, "sandbox.test_runs", 1, 0); err != nil {
+		if err := insertUsage(ctx, tx, runID, "sandbox.test_runs", 1, 0, "", profileName(cur.ProfileJSON)); err != nil {
 			return err
 		}
-		_, err := appendEvent(ctx, tx, runID, "command.finished", "system", "verifier", map[string]any{
+		_, err = appendEvent(ctx, tx, runID, "command.finished", "system", "verifier", map[string]any{
 			"command_id": commandID, "tool": tool, "decision": "allow", "args_hash": argsHash,
-			"exit_code": exitCode, "output_excerpt": clip(output, 500),
+			"exit_code": exitCode, "output_excerpt": clip(redact.Text(output), 500),
 		})
 		return err
 	})
@@ -338,7 +444,7 @@ func (s *Store) Approve(ctx context.Context, in Approval) (Run, error) {
 			return ErrConflict
 		}
 		if nextRun == run.Executing {
-			if _, err := tx.Exec(ctx, `INSERT INTO run_jobs (run_id, status) VALUES ($1, 'queued')`, in.RunID); err != nil {
+			if err := enqueueJob(ctx, tx, in.RunID); err != nil {
 				return err
 			}
 		}
@@ -359,7 +465,84 @@ func (s *Store) Approve(ctx context.Context, in Approval) (Run, error) {
 }
 
 func (s *Store) Enqueue(ctx context.Context, runID string) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO run_jobs (run_id, status) VALUES ($1, 'queued')`, runID)
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		return enqueueJob(ctx, tx, runID)
+	})
+}
+
+// Resume moves a paused run back to PLANNING and enqueues a job when none is active.
+// budget, when set, is only accepted from PAUSED_BUDGET and must not lower the cap.
+func (s *Store) Resume(ctx context.Context, runID string, fromVersion int64, from run.State, budget *int) (Run, error) {
+	if from != run.Paused && from != run.PausedBudget {
+		return Run{}, fmt.Errorf("resume requires PAUSED or PAUSED_BUDGET")
+	}
+	var out Run
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		cur, err := lockRun(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		if cur.StateVersion != fromVersion || cur.State != from {
+			return ErrConflict
+		}
+		if budget != nil {
+			if from != run.PausedBudget {
+				return ErrConflict
+			}
+			if *budget < cur.BudgetCents {
+				return fmt.Errorf("budget_cents must be at least %d", cur.BudgetCents)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE runs SET budget_cents=$2 WHERE id=$1`, runID, *budget); err != nil {
+				return err
+			}
+		}
+		if !run.Can(cur.State, run.Planning) {
+			return fmt.Errorf("illegal transition %s -> %s", cur.State, run.Planning)
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE runs SET state=$2, state_version=state_version+1, updated_at=now()
+			WHERE id=$1 AND state_version=$3`, runID, string(run.Planning), fromVersion)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		if _, err := appendEvent(ctx, tx, runID, "state.changed", "system", "resume", map[string]any{
+			"from": cur.State, "to": run.Planning,
+		}); err != nil {
+			return err
+		}
+		if err := enqueueJob(ctx, tx, runID); err != nil {
+			return err
+		}
+		out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM runs WHERE id=$1`, runID))
+		return err
+	})
+	return out, err
+}
+
+func enqueueJob(ctx context.Context, tx pgx.Tx, runID string) error {
+	if _, err := tx.Exec(ctx, `SAVEPOINT enqueue_job`); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO run_jobs (run_id, status)
+		SELECT $1, 'queued'
+		WHERE NOT EXISTS (
+			SELECT 1 FROM run_jobs WHERE run_id=$1 AND status IN ('queued', 'claimed')
+		)`, runID)
+	if err != nil {
+		if isUnique(err) {
+			if _, rollErr := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT enqueue_job`); rollErr != nil {
+				return rollErr
+			}
+			_, relErr := tx.Exec(ctx, `RELEASE SAVEPOINT enqueue_job`)
+			return relErr
+		}
+		return err
+	}
+	_, err = tx.Exec(ctx, `RELEASE SAVEPOINT enqueue_job`)
 	return err
 }
 
@@ -375,27 +558,163 @@ func (s *Store) ClaimJob(ctx context.Context, owner string) (Job, error) {
 			LIMIT 1
 		)
 		UPDATE run_jobs AS j
-		SET status = 'claimed', lease_owner = $1, lease_until = now() + interval '30 seconds'
+		SET status = 'claimed', lease_owner = $1, lease_until = now() + interval '30 seconds',
+			fence = fence + 1
 		FROM next
 		WHERE j.id = next.id
-		RETURNING j.id, j.run_id`, owner).Scan(&job.ID, &job.RunID)
+		RETURNING j.id, j.run_id, j.fence`, owner).Scan(&job.ID, &job.RunID, &job.Fence)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, ErrNotFound
 	}
 	return job, err
 }
 
-func (s *Store) FinishJob(ctx context.Context, jobID int64) error {
-	_, err := s.pool.Exec(ctx, `UPDATE run_jobs SET status='done', lease_until=NULL WHERE id=$1`, jobID)
-	return err
+func (s *Store) RenewLease(ctx context.Context, jobID int64, owner string, fence int64) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE run_jobs
+		SET lease_until = now() + interval '30 seconds'
+		WHERE id=$1 AND lease_owner=$2 AND fence=$3 AND status='claimed'`, jobID, owner, fence)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	return nil
 }
 
-func (s *Store) ReleaseJob(ctx context.Context, jobID int64) error {
-	_, err := s.pool.Exec(ctx, `
+func (s *Store) FinishJob(ctx context.Context, jobID int64, owner string, fence int64) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE run_jobs
+		SET status='done', lease_until=NULL
+		WHERE id=$1 AND lease_owner=$2 AND fence=$3 AND status='claimed'`, jobID, owner, fence)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (s *Store) ReleaseJob(ctx context.Context, jobID int64, owner string, fence int64) error {
+	tag, err := s.pool.Exec(ctx, `
 		UPDATE run_jobs
 		SET status='queued', lease_owner='', lease_until=NULL
+		WHERE id=$1 AND lease_owner=$2 AND fence=$3 AND status='claimed'`, jobID, owner, fence)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// FinishIfQuiescent marks the job done only when this owner still holds the
+// fence and the run is waiting or terminal. A working run returns false so
+// the same worker continues. Lock the run before the job.
+func (s *Store) FinishIfQuiescent(ctx context.Context, jobID int64, owner string, fence int64) (bool, error) {
+	var finished bool
+	err := s.withTx(ctx, func(tx pgx.Tx) error {
+		var runID string
+		err := tx.QueryRow(ctx, `SELECT run_id FROM run_jobs WHERE id=$1`, jobID).Scan(&runID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		cur, err := lockRun(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		var gotOwner, status string
+		var gotFence int64
+		err = tx.QueryRow(ctx, `
+			SELECT lease_owner, fence, status FROM run_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&gotOwner, &gotFence, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if status != "claimed" || gotOwner != owner || gotFence != fence {
+			return ErrConflict
+		}
+		if !run.Quiescent(cur.State) {
+			return nil
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE run_jobs
+			SET status='done', lease_until=NULL
+			WHERE id=$1 AND lease_owner=$2 AND fence=$3 AND status='claimed'`, jobID, owner, fence)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		finished = true
+		return nil
+	})
+	return finished, err
+}
+
+// ExpireLease makes a claimed job eligible for another worker without waiting.
+func (s *Store) ExpireLease(ctx context.Context, jobID int64) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE run_jobs SET lease_until = now() - interval '1 second'
 		WHERE id=$1 AND status='claimed'`, jobID)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ActiveJob returns the queued or claimed job for a run.
+func (s *Store) ActiveJob(ctx context.Context, runID string) (Job, error) {
+	var job Job
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, run_id, fence FROM run_jobs
+		WHERE run_id=$1 AND status IN ('queued', 'claimed')
+		ORDER BY id
+		LIMIT 1`, runID).Scan(&job.ID, &job.RunID, &job.Fence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, ErrNotFound
+	}
+	return job, err
+}
+
+func (s *Store) AddUsage(ctx context.Context, runID, kind string, quantity, cost int64, modelName, profileName string) error {
+	return s.withTx(ctx, func(tx pgx.Tx) error {
+		if _, err := lockRun(ctx, tx, runID); err != nil {
+			return err
+		}
+		return insertUsage(ctx, tx, runID, kind, quantity, cost, modelName, profileName)
+	})
+}
+
+func (s *Store) ListUsage(ctx context.Context, runID string) ([]Usage, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT kind, quantity, cost_micros, model_name, profile_name
+		FROM usage_entries WHERE run_id=$1 ORDER BY id ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Usage
+	for rows.Next() {
+		var row Usage
+		if err := rows.Scan(&row.Kind, &row.Quantity, &row.CostMicros, &row.ModelName, &row.ProfileName); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 const commandColumns = `
@@ -420,11 +739,19 @@ func scanCommand(row pgx.Row) (Command, error) {
 	return cmd, nil
 }
 
-func insertUsage(ctx context.Context, tx pgx.Tx, runID, kind string, quantity, cost int64) error {
+func insertUsage(ctx context.Context, tx pgx.Tx, runID, kind string, quantity, cost int64, modelName, profileName string) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO usage_entries (run_id, kind, quantity, cost_micros)
-		VALUES ($1,$2,$3,$4)`, runID, kind, quantity, cost)
+		INSERT INTO usage_entries (run_id, kind, quantity, cost_micros, model_name, profile_name)
+		VALUES ($1,$2,$3,$4,$5,$6)`, runID, kind, quantity, cost, modelName, profileName)
 	return err
+}
+
+func profileName(raw json.RawMessage) string {
+	prof, err := profile.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return prof.Name
 }
 
 func nonempty(value, fallback string) string {

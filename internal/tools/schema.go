@@ -27,9 +27,9 @@ func Definitions() []any {
 		fn("search_code", "Search the repository for a literal string.", object(map[string]any{"query": str}, []string{"query"})),
 		fn("read_file_range", "Read an inclusive 1-based line range from one file.", object(map[string]any{"path": str, "start": num, "end": num}, []string{"path", "start", "end"})),
 		fn("git_diff", "Show the uncommitted diff in the run worktree.", object(map[string]any{}, nil)),
-		fn("run_test", "Run the repository test suite inside the sandbox.", object(map[string]any{}, nil)),
+		fn("run_test", "Run the user-selected test command inside the sandbox. The command is fixed for the run.", object(map[string]any{}, nil)),
 		fn("apply_patch", "Replace one exact occurrence of old text with new text in a worktree file.", object(map[string]any{"path": str, "old": str, "new": str}, []string{"path", "old", "new"})),
-		fn("git_push", "Request a git push. This always requires approval and does not run until granted.", object(map[string]any{"remote": str, "branch": str, "commit": str}, []string{"remote", "branch", "commit"})),
-		fn("pr_open", "Request opening a pull request. This always requires approval.", object(map[string]any{"branch": str, "title": str}, []string{"branch", "title"})),
+		fn("write_file", "Create or replace a text file. before_sha256 must match the current file, or be empty when the file must not exist.", object(map[string]any{"path": str, "content": str, "before_sha256": str}, []string{"path", "content", "before_sha256"})),
+		fn("delete_file", "Delete one file whose bytes hash to before_sha256. Directories are not deleted.", object(map[string]any{"path": str, "before_sha256": str}, []string{"path", "before_sha256"})),
 	}
 }

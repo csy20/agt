@@ -18,21 +18,29 @@ import (
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/orch"
 	"github.com/csy20/agt/internal/run"
+	"github.com/csy20/agt/internal/store"
 	"github.com/csy20/agt/internal/testutil"
+	"github.com/csy20/agt/internal/version"
 )
+
+const testToken = "test-token-value1"
 
 func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	st := testutil.Open(t)
-	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}).Handler())
+	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}, testToken).Handler())
 	t.Cleanup(ts.Close)
 
 	health, err := http.Get(ts.URL + "/healthz")
 	if err != nil {
 		t.Fatal(err)
 	}
+	healthBody, _ := io.ReadAll(health.Body)
 	health.Body.Close()
-	if health.StatusCode != http.StatusOK {
-		t.Fatalf("health %d", health.StatusCode)
+	if health.StatusCode != http.StatusOK || string(healthBody) != "ok\n" {
+		t.Fatalf("health %d %q", health.StatusCode, healthBody)
+	}
+	if health.Header.Get(version.ProductHeader) != version.Name || health.Header.Get(version.VersionHeader) != version.Product {
+		t.Fatalf("health identity %v", health.Header)
 	}
 
 	body := map[string]any{
@@ -42,10 +50,29 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 		"script_path":  filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
 		"budget_cents": 100,
 		"max_steps":    0,
+		"profile":      pythonProfile(),
 	}
 	first := postRun(t, ts.URL, body, "idem-1")
 	if first.status != http.StatusAccepted {
 		t.Fatalf("create %d %s", first.status, first.body)
+	}
+	listed := getJSON(t, ts.URL+"/v1/runs")
+	listedRaw, _ := json.Marshal(listed)
+	if !strings.Contains(string(listedRaw), first.runID) {
+		t.Fatalf("list %s", listedRaw)
+	}
+	identReq, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/identity", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identResp, err := http.DefaultClient.Do(identReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identBody, _ := io.ReadAll(identResp.Body)
+	identResp.Body.Close()
+	if identResp.StatusCode != http.StatusOK || !strings.Contains(string(identBody), version.Product) {
+		t.Fatalf("identity %d %s", identResp.StatusCode, identBody)
 	}
 	second := postRun(t, ts.URL, body, "idem-1")
 	if second.status != http.StatusOK || second.runID != first.runID {
@@ -65,6 +92,18 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	if openai.status != http.StatusBadRequest || !strings.Contains(openai.body, "AGT_MODEL_API_KEY") {
 		t.Fatalf("openai guard %d %s", openai.status, openai.body)
 	}
+	localSrv := httptest.NewServer(api.New(st, config.Config{
+		Provider:     "openai",
+		ModelName:    "local-model",
+		ModelBaseURL: "http://127.0.0.1:9/v1",
+	}, testToken).Handler())
+	defer localSrv.Close()
+	local := postRun(t, localSrv.URL, map[string]any{
+		"goal": "local model", "repo_path": testutil.Fixture(t), "provider": "openai",
+	}, "idem-local")
+	if local.status != http.StatusBadRequest || strings.Contains(local.body, "AGT_MODEL_API_KEY") || !strings.Contains(local.body, "profile") {
+		t.Fatalf("loopback key guard %d %s", local.status, local.body)
+	}
 
 	view := getJSON(t, ts.URL+"/v1/runs/"+first.runID)
 	if _, ok := view["script_json"]; ok {
@@ -73,9 +112,89 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	if view["usage_micros"] == nil {
 		t.Fatal("run view missing usage_micros")
 	}
+	prof, _ := view["profile"].(map[string]any)
+	argv, _ := prof["argv"].([]any)
+	image, _ := prof["image"].(string)
+	if prof["name"] != "python" || image == "" || len(argv) != 4 {
+		t.Fatalf("profile %#v", view["profile"])
+	}
+
+	missing := postRun(t, ts.URL, map[string]any{
+		"goal": "no profile", "repo_path": testutil.Fixture(t), "provider": "fake",
+		"script_path": filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+	}, "idem-noprofile")
+	if missing.status != http.StatusBadRequest || !strings.Contains(missing.body, "profile") {
+		t.Fatalf("missing profile %d %s", missing.status, missing.body)
+	}
+	imaged := postRun(t, ts.URL, map[string]any{
+		"goal": "image", "repo_path": testutil.Fixture(t), "provider": "fake",
+		"script_path": filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+		"profile":     map[string]any{"name": "python", "argv": []string{"python"}, "image": "evil:latest"},
+	}, "idem-image")
+	if imaged.status != http.StatusBadRequest || !strings.Contains(imaged.body, "image") {
+		t.Fatalf("image field %d %s", imaged.status, imaged.body)
+	}
+	goRepo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(goRepo, "go.mod"), []byte("module example.com/x\n\ngo 1.23.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kept := postRun(t, ts.URL, map[string]any{
+		"goal": "stay on python", "repo_path": goRepo, "provider": "fake",
+		"script_path": filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+		"profile":     pythonProfile(),
+	}, "idem-keep-python")
+	if kept.status != http.StatusAccepted {
+		t.Fatalf("explicit profile %d %s", kept.status, kept.body)
+	}
+	keptView := getJSON(t, ts.URL+"/v1/runs/"+kept.runID)
+	keptProfile, _ := keptView["profile"].(map[string]any)
+	if keptProfile["name"] != "python" {
+		t.Fatalf("repo marker overrode the profile: %#v", keptView["profile"])
+	}
 }
 
-func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
+func pythonProfile() map[string]any {
+	return map[string]any{
+		"name": "python",
+		"argv": []string{"python", "-m", "unittest", "tests.test_retry"},
+	}
+}
+
+func TestInteractionIsStoredWithoutTheSession(t *testing.T) {
+	st := testutil.Open(t)
+	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}, testToken).Handler())
+	t.Cleanup(ts.Close)
+	body := map[string]any{
+		"goal":         "what does charge do?",
+		"repo_path":    testutil.Fixture(t),
+		"provider":     "fake",
+		"script_path":  filepath.Join(testutil.RepoRoot(t), "eval", "scripts", "fix_retry.json"),
+		"budget_cents": 100,
+		"max_steps":    4,
+		"profile":      pythonProfile(),
+		"interaction":  "ask",
+	}
+	created := postRun(t, ts.URL, body, "idem-ask")
+	if created.status != http.StatusAccepted {
+		t.Fatalf("create %d %s", created.status, created.body)
+	}
+	view := getJSON(t, ts.URL+"/v1/runs/"+created.runID)
+	if view["interaction"] != "ask" {
+		t.Fatalf("interaction %#v", view["interaction"])
+	}
+	body["interaction"] = "plan"
+	conflict := postRun(t, ts.URL, body, "idem-ask")
+	if conflict.status != http.StatusConflict {
+		t.Fatalf("plan replay %d %s", conflict.status, conflict.body)
+	}
+	body["interaction"] = "repair"
+	rejected := postRun(t, ts.URL, body, "idem-repair")
+	if rejected.status != http.StatusBadRequest || !strings.Contains(rejected.body, "interaction") {
+		t.Fatalf("bad mode %d %s", rejected.status, rejected.body)
+	}
+}
+
+func TestScriptedPushIsDeniedNotSuccessful(t *testing.T) {
 	st := testutil.Open(t)
 	eng := testutil.NewEngine(t, st, orch.Hooks{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -84,27 +203,79 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 
 	script := []byte(`{"steps":[{"tool":"git_push","args":{"remote":"origin","branch":"agent/demo","commit":"abc123"},"input_tokens":20,"output_tokens":10}]}`)
 	created := eng.Create(t, "push the branch", testutil.Fixture(t), 100, 16, script)
-	current := testutil.WaitState(t, st, created.ID, run.AwaitingApproval, 15*time.Second)
-	time.Sleep(300 * time.Millisecond)
-	before, err := st.MaxSeq(context.Background(), created.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	version := current.StateVersion
+	end := testutil.WaitState(t, st, created.ID, run.FailedTerminal, 15*time.Second)
 	cmds, err := st.ListCommands(context.Background(), created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cmds) != 1 || cmds[0].State != "awaiting_approval" {
+	if len(cmds) != 1 || cmds[0].State != "denied" || cmds[0].Tool != "git_push" {
 		testutil.Dump(t, st, created.ID)
 		t.Fatalf("commands %+v", cmds)
 	}
-	cmd := cmds[0]
+	if !strings.Contains(string(cmds[0].Result), "unsupported") {
+		t.Fatalf("result %s", cmds[0].Result)
+	}
+	if cmds[0].State == "succeeded" {
+		t.Fatal("unsupported push was recorded as succeeded")
+	}
+	if eng.Created() != 0 {
+		t.Fatalf("workspace created %d", eng.Created())
+	}
+	if eng.Runner != nil && eng.Runner.ExecCount() != 0 {
+		t.Fatalf("sandbox execs %d", eng.Runner.ExecCount())
+	}
+	if strings.Contains(strings.ToLower(end.Error), "pushed") {
+		t.Fatalf("run claims a push: %s", end.Error)
+	}
+	assertNoContainer(t, created.ID)
+}
 
-	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}).Handler())
+func TestApprovalHashIsBoundAndPushStaysUnsupported(t *testing.T) {
+	st := testutil.Open(t)
+	eng := testutil.NewEngine(t, st, orch.Hooks{})
+	script := []byte(`{"steps":[{"finish":true,"text":"unused"}]}`)
+	created := eng.Create(t, "hold for approval", testutil.Fixture(t), 100, 16, script)
+	ctx := context.Background()
+	cur, err := st.Transition(ctx, created.ID, created.StateVersion, run.Contextualising, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err = st.Transition(ctx, cur.ID, cur.StateVersion, run.Planning, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err = st.CommitModelIntent(ctx, cur.ID, cur.StateVersion, store.Intent{
+		Kind:         "tool",
+		Tool:         "git_push",
+		Canonical:    []byte(`{"branch":"agent/demo","commit":"abc123","remote":"origin"}`),
+		ArgsHash:     "hash-ok",
+		Decision:     "require_approval",
+		Reason:       "external mutation",
+		CommandID:    "cmd_push",
+		InputTokens:  20,
+		OutputTokens: 10,
+		CostMicros:   1,
+		Model:        "fake",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.State != run.AwaitingApproval {
+		t.Fatalf("state %s", cur.State)
+	}
+	workCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go (&orch.Worker{Store: st, Run: eng.Orch.Run}).Loop(workCtx)
+
+	before, err := st.MaxSeq(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version := cur.StateVersion
+	ts := httptest.NewServer(api.New(st, config.Config{Provider: "fake"}, testToken).Handler())
 	t.Cleanup(ts.Close)
 	wrong := postJSON(t, ts.URL+"/v1/runs/"+created.ID+"/approvals", map[string]any{
-		"command_id": cmd.CommandID,
+		"command_id": "cmd_push",
 		"args_hash":  "deadbeef",
 		"decision":   "approved",
 	}, "")
@@ -112,14 +283,14 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 	if wrong.status != http.StatusConflict {
 		t.Fatalf("wrong hash %d", wrong.status)
 	}
-	after, err := st.MaxSeq(context.Background(), created.ID)
+	after, err := st.MaxSeq(ctx, created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if after != before {
 		t.Fatalf("wrong hash wrote events %d -> %d", before, after)
 	}
-	current, err = st.GetRun(context.Background(), created.ID)
+	current, err := st.GetRun(ctx, created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +302,8 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 	}
 
 	ok := postJSON(t, ts.URL+"/v1/runs/"+created.ID+"/approvals", map[string]any{
-		"command_id": cmd.CommandID,
-		"args_hash":  cmd.ArgsHash,
+		"command_id": "cmd_push",
+		"args_hash":  "hash-ok",
 		"decision":   "approved",
 	}, "")
 	okBody, _ := io.ReadAll(ok.body)
@@ -141,11 +312,11 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 		t.Fatalf("approve %d %s", ok.status, okBody)
 	}
 	end := testutil.WaitState(t, st, created.ID, run.FailedTerminal, 15*time.Second)
-	finished, err := st.GetCommand(context.Background(), created.ID, cmd.CommandID)
+	finished, err := st.GetCommand(ctx, created.ID, "cmd_push")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if finished.State != "succeeded" || !strings.Contains(string(finished.Result), "no process was spawned") {
+	if finished.State == "succeeded" || !strings.Contains(string(finished.Result), "unsupported") {
 		testutil.Dump(t, st, created.ID)
 		t.Fatalf("command %s %s", finished.State, finished.Result)
 	}
@@ -155,7 +326,7 @@ func TestApprovalBindsHashAndDoesNotExec(t *testing.T) {
 	if eng.Runner != nil && eng.Runner.ExecCount() != 0 {
 		t.Fatalf("sandbox execs %d", eng.Runner.ExecCount())
 	}
-	if !strings.Contains(end.Error, "no step") {
+	if !strings.Contains(end.Error, "unsupported") {
 		t.Fatalf("error %q", end.Error)
 	}
 	assertNoContainer(t, created.ID)
@@ -200,6 +371,7 @@ func postJSON(t *testing.T, url string, body map[string]any, key string) respons
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testToken)
 	if key != "" {
 		req.Header.Set("Idempotency-Key", key)
 	}
@@ -212,7 +384,12 @@ func postJSON(t *testing.T, url string, body map[string]any, key string) respons
 
 func getJSON(t *testing.T, url string) map[string]any {
 	t.Helper()
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

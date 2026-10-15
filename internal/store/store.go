@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/csy20/agt/internal/diag"
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/run"
 	"github.com/jackc/pgx/v5"
@@ -23,7 +24,8 @@ const runColumns = `
 id, idempotency_key, request_hash, goal, repo_path, worktree, state, state_version,
 risk_level, budget_cents, spent_micros, agent_version, trace_id, provider, script_path,
 COALESCE(script_json, 'null'::jsonb), COALESCE(plan_json, 'null'::jsonb), COALESCE(result_json, 'null'::jsonb),
-error, step_count, max_steps, deadline_at, created_at, updated_at`
+error, step_count, max_steps, deadline_at, created_at, updated_at, profile_json, interaction,
+COALESCE(session_id, '')`
 
 type Store struct {
 	pool *pgxpool.Pool
@@ -54,6 +56,9 @@ type Run struct {
 	Deadline       time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	ProfileJSON    json.RawMessage
+	Interaction    string
+	SessionID      string
 }
 
 type Event struct {
@@ -79,6 +84,9 @@ type CreateInput struct {
 	Provider       string
 	ScriptPath     string
 	ScriptJSON     json.RawMessage
+	ProfileJSON    json.RawMessage
+	Interaction    string
+	SessionID      string
 }
 
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -95,7 +103,7 @@ func Open(ctx context.Context, url string) (*Store, error) {
 	defer cancel()
 	if err := pool.Ping(pingCtx); err != nil {
 		pool.Close()
-		return nil, err
+		return nil, diag.PostgresUnreachable(url, err)
 	}
 	return &Store{pool: pool}, nil
 }
@@ -105,24 +113,61 @@ func (s *Store) Close() { s.pool.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	applied, err := s.migrationApplied(ctx, 1)
-	if err != nil {
+	if err := s.applyMigration(ctx, 1, "migrations/001_init.sql"); err != nil {
 		return err
 	}
-	if applied {
-		return nil
+	if err := s.applyMigration(ctx, 2, "migrations/002_profile.sql"); err != nil {
+		return err
 	}
-	sqlBytes, err := migrationFS.ReadFile("migrations/001_init.sql")
+	if err := s.applyMigration(ctx, 3, "migrations/003_transcript.sql"); err != nil {
+		return err
+	}
+	if err := s.applyMigration(ctx, 4, "migrations/004_lease.sql"); err != nil {
+		return err
+	}
+	if err := s.applyMigration(ctx, 5, "migrations/005_interaction.sql"); err != nil {
+		return err
+	}
+	return s.applyMigration(ctx, 6, "migrations/006_sessions.sql")
+}
+
+func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
+	applied, err := s.migrationApplied(ctx, version)
+	if err != nil || applied {
+		return err
+	}
+	sqlBytes, err := migrationFS.ReadFile(name)
 	if err != nil {
 		return err
 	}
 	return s.withTx(ctx, func(tx pgx.Tx) error {
-		for _, stmt := range splitSQL(string(sqlBytes)) {
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("migration: %w", err)
+		// 8675310 is only the migration lock. Tests hold session lock 8675309
+		// on another connection for the whole test; sharing that key deadlocks.
+		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '30s'`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(8675310)`); err != nil {
+			return err
+		}
+		var reg *string
+		if err := tx.QueryRow(ctx, `SELECT to_regclass('public.schema_migrations')`).Scan(&reg); err != nil {
+			return err
+		}
+		if reg != nil {
+			var n int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=$1`, version).Scan(&n); err != nil {
+				return err
+			}
+			if n > 0 {
+				return nil
 			}
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES (1)`)
+		for _, stmt := range splitSQL(string(sqlBytes)) {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("migration %d: %w", version, err)
+			}
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, version)
 		return err
 	})
 }
@@ -155,7 +200,8 @@ func (s *Store) migrationApplied(ctx context.Context, version int) (bool, error)
 
 func (s *Store) Reset(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
-		TRUNCATE usage_entries, approvals, commands, run_events, run_jobs, runs
+		TRUNCATE model_messages, usage_entries, approvals, commands, run_events, run_jobs,
+			session_messages, runs, sessions
 		RESTART IDENTITY CASCADE`)
 	return err
 }
@@ -182,36 +228,17 @@ func (s *Store) CreateRun(ctx context.Context, in CreateInput) (Run, bool, error
 	if in.WallSeconds <= 0 {
 		in.WallSeconds = 300
 	}
-	deadline := time.Now().Add(time.Duration(in.WallSeconds) * time.Second)
-	var script any
-	if len(in.ScriptJSON) > 0 {
-		script = string(in.ScriptJSON)
+	switch in.Interaction {
+	case "", "agent":
+		in.Interaction = "agent"
+	case "ask", "plan":
+	default:
+		return Run{}, false, fmt.Errorf("interaction must be agent, ask, or plan")
 	}
 	var out Run
 	err := s.withTx(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO runs (
-				id, idempotency_key, request_hash, goal, repo_path, state, state_version,
-				budget_cents, agent_version, trace_id, provider, script_path, script_json,
-				max_steps, deadline_at
-			) VALUES (
-				$1,$2,$3,$4,$5,'CREATED',1,$6,$7,$8,$9,$10,$11::jsonb,$12,$13
-			)`,
-			in.ID, in.IdempotencyKey, in.RequestHash, in.Goal, in.RepoPath, in.BudgetCents,
-			in.AgentVersion, in.TraceID, in.Provider, in.ScriptPath, script, in.MaxSteps, deadline,
-		)
-		if err != nil {
-			return err
-		}
-		if _, err := appendEvent(ctx, tx, in.ID, "run.created", "user", "local", map[string]any{
-			"goal": in.Goal, "repo_path": in.RepoPath, "provider": in.Provider,
-		}); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO run_jobs (run_id, status) VALUES ($1, 'queued')`, in.ID); err != nil {
-			return err
-		}
-		out, err = scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM runs WHERE id=$1`, in.ID))
+		var err error
+		out, err = insertRunTx(ctx, tx, in)
 		return err
 	})
 	if err != nil {
@@ -233,6 +260,30 @@ func (s *Store) CreateRun(ctx context.Context, in CreateInput) (Run, bool, error
 
 func (s *Store) GetRun(ctx context.Context, runID string) (Run, error) {
 	return scanRun(s.pool.QueryRow(ctx, `SELECT `+runColumns+` FROM runs WHERE id=$1`, runID))
+}
+
+// ListRuns returns the newest runs, up to limit. limit is clamped to 1..100.
+func (s *Store) ListRuns(ctx context.Context, limit int) ([]Run, error) {
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+runColumns+` FROM runs ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Run{}
+	for rows.Next() {
+		current, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, current)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) getByIdempotency(ctx context.Context, key string) (Run, error) {
@@ -330,6 +381,16 @@ func (s *Store) SetWorktree(ctx context.Context, runID, path string) error {
 	return nil
 }
 
+// AppendDisplay records assistant text for the session to show while the
+// model response is still being read. It does not execute a tool.
+func (s *Store) AppendDisplay(ctx context.Context, runID, text string) error {
+	if text == "" {
+		return nil
+	}
+	_, err := s.AppendEvent(ctx, runID, "assistant.delta", "model", "display", map[string]any{"text": text})
+	return err
+}
+
 func (s *Store) SetResult(ctx context.Context, runID string, result any, errText string) error {
 	body, err := json.Marshal(result)
 	if err != nil {
@@ -363,6 +424,11 @@ func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return tx.Commit(ctx)
 }
 
+func isUnique(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
 func lockRun(ctx context.Context, tx pgx.Tx, runID string) (Run, error) {
 	return scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM runs WHERE id=$1 FOR UPDATE`, runID))
 }
@@ -370,13 +436,13 @@ func lockRun(ctx context.Context, tx pgx.Tx, runID string) (Run, error) {
 func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	var state string
-	var script, plan, result []byte
+	var script, plan, result, profileJSON []byte
 	err := row.Scan(
 		&r.ID, &r.IdempotencyKey, &r.RequestHash, &r.Goal, &r.RepoPath, &r.Worktree,
 		&state, &r.StateVersion, &r.RiskLevel, &r.BudgetCents, &r.SpentMicros,
 		&r.AgentVersion, &r.TraceID, &r.Provider, &r.ScriptPath,
 		&script, &plan, &result, &r.Error, &r.StepCount, &r.MaxSteps,
-		&r.Deadline, &r.CreatedAt, &r.UpdatedAt,
+		&r.Deadline, &r.CreatedAt, &r.UpdatedAt, &profileJSON, &r.Interaction, &r.SessionID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Run{}, ErrNotFound
@@ -388,6 +454,7 @@ func scanRun(row pgx.Row) (Run, error) {
 	r.ScriptJSON = script
 	r.Plan = plan
 	r.Result = result
+	r.ProfileJSON = profileJSON
 	return r, nil
 }
 

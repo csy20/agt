@@ -2,12 +2,10 @@ package workspace
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,6 +23,8 @@ type Handle interface {
 	Read(ctx context.Context, path string, start, end int) (string, int, error)
 	Diff(ctx context.Context) (string, int, error)
 	Patch(ctx context.Context, path, old, new string) (string, int, error)
+	Write(ctx context.Context, args tools.WriteArgs) (string, int, error)
+	Delete(ctx context.Context, args tools.DeleteArgs) (string, int, error)
 	Test(ctx context.Context) (string, int, error)
 	Calls() []string
 	Close(ctx context.Context) error
@@ -82,7 +82,7 @@ func (d *Dir) Diff(context.Context) (string, int, error) {
 	d.note("git_diff")
 	out, err := tools.Diff(d.Base, d.Work)
 	if err != nil {
-		return err.Error(), 2, nil
+		return "", 2, err
 	}
 	return out, 0, nil
 }
@@ -92,6 +92,30 @@ func (d *Dir) Patch(_ context.Context, path, old, new string) (string, int, erro
 	out, err := tools.Patch(d.Work, path, old, new)
 	if err != nil {
 		return err.Error(), 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Write(_ context.Context, args tools.WriteArgs) (string, int, error) {
+	d.note("write_file")
+	out, err := tools.WriteFile(d.Work, args)
+	if err != nil {
+		if out == "" {
+			out = err.Error()
+		}
+		return out, 2, nil
+	}
+	return out, 0, nil
+}
+
+func (d *Dir) Delete(_ context.Context, args tools.DeleteArgs) (string, int, error) {
+	d.note("delete_file")
+	out, err := tools.DeleteFile(d.Work, args)
+	if err != nil {
+		if out == "" {
+			out = err.Error()
+		}
+		return out, 2, nil
 	}
 	return out, 0, nil
 }
@@ -119,8 +143,21 @@ func (d *Dir) Close(ctx context.Context) error {
 	return nil
 }
 
-// Materialize copies repo into dataDir/runs/<id>/{work,base}. Symlinks are refused.
+// MaxCopyFileBytes is the largest regular file Materialize will copy.
+// Larger files fail the copy instead of being dropped silently.
+const MaxCopyFileBytes = 8 << 20
+
+// Materialize copies the working tree, including uncommitted files, into
+// dataDir/runs/<id>/{work,base}. It does not create a Git worktree: a checkout
+// would drop uncommitted files, and the fixtures are not Git repositories.
+// The source tree is not modified. .git is not copied. Symlinks are refused.
+// Executable bits are preserved. Dotfiles are included except the directory
+// names reported by tools.SkipDir and secret names such as .env, .ssh, and
+// private keys. .env.example is copied.
 func Materialize(repo, dataDir, runID string) (work, base string, err error) {
+	if err := Overlap(repo, dataDir); err != nil {
+		return "", "", err
+	}
 	root := filepath.Join(dataDir, "runs", runID)
 	if err := os.RemoveAll(root); err != nil {
 		return "", "", err
@@ -152,20 +189,27 @@ func copyTree(src, dst string) error {
 		if d.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("refusing to copy symlink %s", rel)
 		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
 		if d.IsDir() {
-			if rel != "." && strings.HasPrefix(d.Name(), ".") {
+			if rel != "." && (tools.SkipDir(d.Name()) || tools.SecretDir(d.Name())) {
 				return filepath.SkipDir
 			}
 			return os.MkdirAll(target, 0o755)
 		}
-		if !d.Type().IsRegular() {
+		if !d.Type().IsRegular() || tools.SecretFile(d.Name()) {
 			return nil
 		}
-		return copyFile(path, target)
+		if info.Size() > MaxCopyFileBytes {
+			return fmt.Errorf("file %s is %d bytes, over the %d byte copy limit", rel, info.Size(), MaxCopyFileBytes)
+		}
+		return copyFile(path, target, info.Mode())
 	})
 }
 
-func copyFile(src, dst string) error {
+func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -174,41 +218,17 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	perm := mode.Perm()
+	if perm == 0 {
+		perm = 0o644
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
-}
-
-// HostPython runs the fixture unittest on the host. The server does not use it.
-func HostPython(ctx context.Context, root string) (string, string, int, error) {
-	cmd := exec.CommandContext(ctx, "python3", "-m", "unittest", "tests.test_retry")
-	cmd.Dir = root
-	cmd.Env = hostPythonEnv(root)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err == nil {
-		return stdout.String(), stderr.String(), 0, nil
+	if _, err := io.Copy(out, in); err != nil {
+		return err
 	}
-	var exit *exec.ExitError
-	if errors.As(err, &exit) {
-		return stdout.String(), stderr.String(), exit.ExitCode(), nil
-	}
-	return stdout.String(), stderr.String(), 0, err
-}
-
-func hostPythonEnv(root string) []string {
-	env := make([]string, 0, 16)
-	for _, item := range os.Environ() {
-		if strings.HasPrefix(item, "PYTHONPATH=") || strings.HasPrefix(item, "PYTHONDONTWRITEBYTECODE=") {
-			continue
-		}
-		env = append(env, item)
-	}
-	return append(env, "PYTHONDONTWRITEBYTECODE=1", "PYTHONPATH="+root)
+	return os.Chmod(dst, perm)
 }

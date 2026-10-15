@@ -4,8 +4,48 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestAskAndPlanStayReadOnly(t *testing.T) {
+	readRaw := json.RawMessage(`{"path":"payments/processor.py","start":1,"end":40}`)
+	patchRaw := json.RawMessage(`{"path":"payments/processor.py","old":"return err","new":"return None"}`)
+	testRaw := json.RawMessage(`{}`)
+	for _, mode := range []string{"ask", "plan"} {
+		read, err := DecideFor(mode, "read_file_range", readRaw)
+		if err != nil || read.Decision != Allow {
+			t.Fatalf("%s read: %+v %v", mode, read, err)
+		}
+		base, err := Decide("apply_patch", patchRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := DecideFor(mode, "apply_patch", patchRaw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Decision != Deny || !strings.Contains(got.Reason, "read-only") || got.ArgsHash != base.ArgsHash {
+			t.Fatalf("%s patch: %+v", mode, got)
+		}
+		runTest, err := DecideFor(mode, "run_test", testRaw)
+		if err != nil || runTest.Decision != Deny || !strings.Contains(runTest.Reason, "read-only") {
+			t.Fatalf("%s run_test: %+v %v", mode, runTest, err)
+		}
+	}
+	agent, err := DecideFor("agent", "run_test", testRaw)
+	if err != nil || agent.Decision != Allow {
+		t.Fatalf("agent run_test: %+v %v", agent, err)
+	}
+	same, err := DecideFor("", "run_test", testRaw)
+	if err != nil || same.Decision != Allow || same.ArgsHash != agent.ArgsHash {
+		t.Fatalf("empty mode: %+v", same)
+	}
+	push, err := DecideFor("plan", "git_push", json.RawMessage(`{"remote":"origin","branch":"main","commit":"abc123"}`))
+	if err != nil || push.Decision != Deny || !strings.Contains(push.Reason, "unsupported") {
+		t.Fatalf("plan push kept the hard denial: %+v", push)
+	}
+}
 
 func TestReadAndPatchDecisions(t *testing.T) {
 	ok, err := Decide("read_file_range", json.RawMessage(`{"path":"payments/processor.py","start":1,"end":40}`))
@@ -28,8 +68,8 @@ func TestReadAndPatchDecisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if push.Decision != RequireApproval {
-		t.Fatalf("push decision = %s", push.Decision)
+	if push.Decision != Deny || !strings.Contains(push.Reason, "unsupported") {
+		t.Fatalf("push decision = %s reason %s", push.Decision, push.Reason)
 	}
 	mutated, err := Decide("git_push", json.RawMessage(`{"remote":"origin","branch":"main","commit":"abc123"}`))
 	if err != nil {
@@ -37,6 +77,63 @@ func TestReadAndPatchDecisions(t *testing.T) {
 	}
 	if mutated.ArgsHash == push.ArgsHash {
 		t.Fatal("changing the branch must change the approval hash")
+	}
+}
+
+func TestSecretPathsAreDenied(t *testing.T) {
+	denied, err := Decide("read_file_range", json.RawMessage(`{"path":".env","start":1,"end":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if denied.Decision != Deny || !strings.Contains(denied.Reason, "secret") {
+		t.Fatalf("env decision %+v", denied)
+	}
+	nested, err := Decide("apply_patch", json.RawMessage(`{"path":".ssh/id_rsa","old":"a","new":"b"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nested.Decision != Deny {
+		t.Fatalf("key decision %+v", nested)
+	}
+	ok, err := Decide("read_file_range", json.RawMessage(`{"path":".env.example","start":1,"end":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok.Decision != Allow {
+		t.Fatalf("example decision %+v", ok)
+	}
+}
+
+func TestWriteAndDeleteStayInsideTheTree(t *testing.T) {
+	ok, err := Decide("write_file", json.RawMessage(`{"path":"counter.go","content":"package p\n","before_sha256":""}`))
+	if err != nil || ok.Decision != Allow {
+		t.Fatalf("write %+v %v", ok, err)
+	}
+	secret, err := Decide("delete_file", json.RawMessage(`{"path":".env","before_sha256":"`+strings.Repeat("ab", 32)+`"}`))
+	if err != nil || secret.Decision != Deny {
+		t.Fatalf("secret delete %+v %v", secret, err)
+	}
+	shell, err := Decide("write_file", json.RawMessage(`{"path":"../x","content":"a","before_sha256":""}`))
+	if err != nil || shell.Decision != Deny {
+		t.Fatalf("escape write %+v %v", shell, err)
+	}
+}
+
+func TestTestEditsRequireApproval(t *testing.T) {
+	write, err := Decide("write_file", json.RawMessage(`{"path":"tests/test_retry.py","content":"x","before_sha256":""}`))
+	if err != nil || write.Decision != RequireApproval {
+		t.Fatalf("python test write %+v %v", write, err)
+	}
+	patch, err := Decide("apply_patch", json.RawMessage(`{"path":"counter_test.go","old":"a","new":"b"}`))
+	if err != nil || patch.Decision != RequireApproval {
+		t.Fatalf("go test patch %+v %v", patch, err)
+	}
+	del, err := Decide("delete_file", json.RawMessage(`{"path":"quote.test.js","before_sha256":"`+strings.Repeat("ab", 32)+`"}`))
+	if err != nil || del.Decision != RequireApproval {
+		t.Fatalf("js test delete %+v %v", del, err)
+	}
+	if write.ArgsHash == "" || write.ArgsHash != hash("write_file", write.Canonical) {
+		t.Fatal("approval hash is not bound to the canonical arguments")
 	}
 }
 

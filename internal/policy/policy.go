@@ -30,6 +30,58 @@ type Result struct {
 	Reason    string
 }
 
+// DecideFor applies Decide, then the run's interaction mode.
+// agent keeps the normal repair policy. ask and plan stay read-only:
+// search, read, and diff may proceed, and every mutation or test run is denied.
+// An empty mode is agent, which is the historical default.
+func DecideFor(interaction, tool string, raw json.RawMessage) (Result, error) {
+	result, err := Decide(tool, raw)
+	if err != nil {
+		return result, err
+	}
+	switch NormalizeInteraction(interaction) {
+	case "agent":
+		return result, nil
+	case "ask", "plan":
+		if result.Decision == Deny || readOnlyTool(tool) {
+			return result, nil
+		}
+		result.Decision = Deny
+		result.Reason = "ask and plan modes are read-only"
+		return result, nil
+	default:
+		return denied(tool, raw, "unknown interaction mode"), nil
+	}
+}
+
+// NormalizeInteraction maps an empty value to agent.
+func NormalizeInteraction(interaction string) string {
+	interaction = strings.TrimSpace(interaction)
+	if interaction == "" {
+		return "agent"
+	}
+	return interaction
+}
+
+// ValidInteraction reports whether a create request may store this mode.
+func ValidInteraction(interaction string) bool {
+	switch NormalizeInteraction(interaction) {
+	case "agent", "ask", "plan":
+		return true
+	default:
+		return false
+	}
+}
+
+func readOnlyTool(tool string) bool {
+	switch tool {
+	case "search_code", "read_file_range", "git_diff":
+		return true
+	default:
+		return false
+	}
+}
+
 // Decide validates tool arguments and assigns a risk decision.
 // Invalid or unknown tools are denied. They never become an execution.
 func Decide(tool string, raw json.RawMessage) (Result, error) {
@@ -56,9 +108,14 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err := decode(raw, &args); err != nil {
 			return denied(tool, raw, "invalid arguments"), nil
 		}
-		if _, err := tools.SafeRel(args.Path); err != nil {
+		rel, err := tools.SafeRel(args.Path)
+		if err != nil {
 			body, _ := json.Marshal(args)
 			return denied(tool, body, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			body, _ := json.Marshal(args)
+			return denied(tool, body, "secret paths are not available to the agent"), nil
 		}
 		if args.Start < 1 || args.End < args.Start || args.End-args.Start > 399 {
 			body, _ := json.Marshal(args)
@@ -88,9 +145,14 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err := decode(raw, &args); err != nil {
 			return denied(tool, raw, "invalid arguments"), nil
 		}
-		if _, err := tools.SafeRel(args.Path); err != nil {
+		rel, err := tools.SafeRel(args.Path)
+		if err != nil {
 			full, _ := json.Marshal(args)
 			return denied(tool, full, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			full, _ := json.Marshal(args)
+			return denied(tool, full, "secret paths are not available to the agent"), nil
 		}
 		if args.Old == "" || args.New == "" || len(args.Old) > 200_000 || len(args.New) > 200_000 {
 			body, _ := json.Marshal(args)
@@ -100,7 +162,66 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
+		if tools.IsTestPath(rel) {
+			return approval(tool, body, "edits that change test files require approval"), nil
+		}
 		return allowed(tool, body, "workspace write inside the run worktree"), nil
+	case "write_file":
+		var write tools.WriteArgs
+		if err := decode(raw, &write); err != nil {
+			return denied(tool, raw, "invalid arguments"), nil
+		}
+		rel, err := tools.SafeRel(write.Path)
+		if err != nil {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, "secret paths are not available to the agent"), nil
+		}
+		if strings.Contains(write.Content, "\x00") || len(write.Content) > 200_000 {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, "content must be text under 200KB"), nil
+		}
+		if !shaOK(write.BeforeSHA256, false) {
+			body, _ := json.Marshal(write)
+			return denied(tool, body, "before_sha256 must be empty or 64 lowercase hex characters"), nil
+		}
+		body, err := json.Marshal(write)
+		if err != nil {
+			return Result{}, err
+		}
+		if tools.IsTestPath(rel) {
+			return approval(tool, body, "edits that change test files require approval"), nil
+		}
+		return allowed(tool, body, "workspace write inside the run worktree"), nil
+	case "delete_file":
+		var del tools.DeleteArgs
+		if err := decode(raw, &del); err != nil {
+			return denied(tool, raw, "invalid arguments"), nil
+		}
+		rel, err := tools.SafeRel(del.Path)
+		if err != nil {
+			body, _ := json.Marshal(del)
+			return denied(tool, body, err.Error()), nil
+		}
+		if tools.SecretRel(rel) {
+			body, _ := json.Marshal(del)
+			return denied(tool, body, "secret paths are not available to the agent"), nil
+		}
+		if !shaOK(del.BeforeSHA256, true) {
+			body, _ := json.Marshal(del)
+			return denied(tool, body, "before_sha256 must be 64 lowercase hex characters"), nil
+		}
+		body, err := json.Marshal(del)
+		if err != nil {
+			return Result{}, err
+		}
+		if tools.IsTestPath(rel) {
+			return approval(tool, body, "edits that change test files require approval"), nil
+		}
+		return allowed(tool, body, "workspace delete inside the run worktree"), nil
 	case "git_push":
 		var args tools.PushArgs
 		if err := decode(raw, &args); err != nil {
@@ -114,7 +235,7 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		return approval(tool, body, "external mutation"), nil
+		return denied(tool, body, "unsupported: git push is not available and no remote process is spawned"), nil
 	case "pr_open":
 		var args tools.PRArgs
 		if err := decode(raw, &args); err != nil {
@@ -128,10 +249,25 @@ func Decide(tool string, raw json.RawMessage) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		return approval(tool, body, "external mutation"), nil
+		return denied(tool, body, "unsupported: opening a pull request is not available and no remote process is spawned"), nil
 	default:
 		return denied(tool, raw, "unknown tool"), nil
 	}
+}
+
+func shaOK(s string, required bool) bool {
+	if s == "" {
+		return !required
+	}
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func token(s string) bool {
@@ -157,6 +293,8 @@ func allowed(tool string, canonical []byte, reason string) Result {
 	return Result{Tool: tool, Decision: Allow, Canonical: canonical, ArgsHash: hash(tool, canonical), Reason: reason}
 }
 
+// approval binds a later human decision to the canonical arguments.
+// git_push and pr_open stay denied. Test-file edits use this gate.
 func approval(tool string, canonical []byte, reason string) Result {
 	return Result{Tool: tool, Decision: RequireApproval, Canonical: canonical, ArgsHash: hash(tool, canonical), Reason: reason}
 }

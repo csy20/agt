@@ -18,7 +18,11 @@ type Request struct {
 	System         string
 	Plan           json.RawMessage
 	Observations   []Observation
+	Transcript     []Turn
 	CompletedCalls int
+	// Display receives assistant text as it arrives. It must not run tools.
+	// Tool calls are returned only after the body is complete and the arguments are valid JSON.
+	Display func(text string)
 }
 
 type Response struct {
@@ -26,9 +30,36 @@ type Response struct {
 	Plan         json.RawMessage
 	Tool         string
 	Args         json.RawMessage
+	ToolCallID   string
+	ModelName    string
 	Finish       bool
 	InputTokens  int
 	OutputTokens int
+	// Attempts is the number of HTTP requests made for this response.
+	// Zero means the provider did not report it.
+	Attempts int
+}
+
+// StatusError is a provider failure after one or more HTTP attempts.
+// Context cancellation is not wrapped in StatusError.
+type StatusError struct {
+	Attempts int
+	Model    string
+	Err      error
+}
+
+func (e *StatusError) Error() string {
+	if e == nil || e.Err == nil {
+		return "model request failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *StatusError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 type Provider interface {

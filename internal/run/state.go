@@ -11,14 +11,26 @@ const (
 	Observing        State = "OBSERVING"
 	Verifying        State = "VERIFYING"
 	AwaitingApproval State = "AWAITING_APPROVAL"
-	Committing       State = "COMMITTING"
-	Succeeded        State = "SUCCEEDED"
-	Paused           State = "PAUSED"
-	PausedBudget     State = "PAUSED_BUDGET"
-	Cancelled        State = "CANCELLED"
-	FailedRetryable  State = "FAILED_RETRYABLE"
-	FailedTerminal   State = "FAILED_TERMINAL"
+	// Committing closes the sandbox and records success. It does not create a Git commit.
+	Committing      State = "COMMITTING"
+	Succeeded       State = "SUCCEEDED"
+	Paused          State = "PAUSED"
+	PausedBudget    State = "PAUSED_BUDGET"
+	Cancelled       State = "CANCELLED"
+	FailedRetryable State = "FAILED_RETRYABLE"
+	FailedTerminal  State = "FAILED_TERMINAL"
 )
+
+// Quiescent reports states where the worker should finish its job.
+// A later resume enqueues a new job. EXECUTING and VERIFYING are not quiescent.
+func Quiescent(s State) bool {
+	switch s {
+	case AwaitingApproval, Paused, PausedBudget, Cancelled, Succeeded, FailedTerminal:
+		return true
+	default:
+		return false
+	}
+}
 
 // IsTerminal reports states that no worker should leave.
 func IsTerminal(s State) bool {
@@ -39,7 +51,7 @@ var forward = map[State][]State{
 	Planning:         {Executing, Observing, Verifying, AwaitingApproval},
 	Executing:        {Observing, AwaitingApproval, Verifying},
 	Observing:        {Planning, Executing, Verifying, AwaitingApproval},
-	Verifying:        {AwaitingApproval, Committing, Succeeded},
+	Verifying:        {Observing, AwaitingApproval, Committing, Succeeded},
 	AwaitingApproval: {Executing, Committing, Observing},
 	Committing:       {Succeeded},
 	Paused:           {Planning},
