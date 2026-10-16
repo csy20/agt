@@ -19,8 +19,10 @@ func TestCreateAndApproveStayOnTheDaemonContract(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/identity" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"product": version.Name, "version": version.Product, "provider": "openai", "model": "local-repair",
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"product": version.Name, "version": version.Product, "contract": version.Contract,
+				"build": "local+test", "capabilities": version.Capabilities(),
+				"provider": "openai", "model": "local-repair",
 			})
 			return
 		}
@@ -70,6 +72,25 @@ func TestCreateAndApproveStayOnTheDaemonContract(t *testing.T) {
 	}
 	if approved["args_hash"] != "abc123" || approved["command_id"] != "cmd_1" || approved["decision"] != "approved" {
 		t.Fatalf("approval %#v", approved)
+	}
+}
+
+func TestIdentityRejectsMatchingVersionWithoutCapabilities(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"product": version.Name, "version": version.Product, "contract": version.Contract,
+			"capabilities": []string{"sessions"},
+		})
+	}))
+	defer srv.Close()
+	_, err := New(srv.URL, "secret-token").Identity(context.Background())
+	if err == nil {
+		t.Fatal("accepted a daemon without models")
+	}
+	for _, part := range []string{srv.URL, version.Product, "does not advertise", "models", "Next: rebuild agtd from this checkout", "This command does not stop another process."} {
+		if !strings.Contains(err.Error(), part) {
+			t.Fatalf("missing %q in %v", part, err)
+		}
 	}
 }
 

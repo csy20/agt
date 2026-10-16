@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/csy20/agt/internal/auth"
 	"github.com/csy20/agt/internal/config"
+	"github.com/csy20/agt/internal/verify"
 	"github.com/csy20/agt/internal/version"
 )
 
@@ -34,6 +36,10 @@ func Run(args []string) int {
 		return 0
 	case "fix":
 		return fix(args[2:])
+	case "feature":
+		return featureCmd(args[2:])
+	case "refactor":
+		return refactorCmd(args[2:])
 	case "profile":
 		return profileCommand(args[2:])
 	case "approve":
@@ -46,6 +52,10 @@ func Run(args []string) int {
 		return tuiCmd(args[2:])
 	case "session":
 		return sessionCmd(args[2:])
+	case "model":
+		return modelCmd(args[2:])
+	case "agent":
+		return agentCmd(args[2:])
 	case "setup":
 		return setupCmd(args[2:])
 	case "completion":
@@ -64,6 +74,8 @@ func usageText() {
 	fmt.Fprint(os.Stderr, `agt is a durable coding-agent terminal.
 
   agt fix --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE "goal"
+  agt feature --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_regress --contract-file contract.json --provider fake --script FILE "goal"
+  agt refactor --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_protected --contract-file contract.json --provider fake --script FILE "goal"
   agt fix --repo PATH --profile go --test-arg go --test-arg test --test-arg ./... "goal"
   agt profile detect --repo PATH
   agt run create --goal TEXT --repo PATH --profile python --test-arg python --test-arg -m --test-arg unittest --test-arg tests.test_retry --provider fake --script FILE
@@ -86,7 +98,11 @@ func usageText() {
   agt session new [--repo PATH]
   agt session open SESSION [--repo PATH]
   agt session show SESSION [--repo PATH]
-  agt session submit SESSION --goal TEXT --repo PATH --profile NAME --message-id ID
+  agt session submit SESSION --goal TEXT --repo PATH --profile NAME --message-id ID [--model-config NAME]
+  agt model list [--json]
+  agt model select NAME [--session ID] [--repo PATH]
+  agt agent list [--json]
+  agt agent ask --authorize-live --repo PATH --prompt TEXT [--server URL]
   agt completion bash|zsh|fish|powershell
   agt version
 
@@ -96,9 +112,12 @@ A repeated --message-id returns the original run. A new prompt while a run is ac
 agt tui --dump prints an example session. It does not start a run or change a repository.
 agt setup writes a profile and a test command after --confirm. It does not choose an image or start a run.
 /plan and /ask inside the session are read-only. The repair state PLANNING still executes.
---profile is required for agt fix. --repo does not select a language or a test command.
+--profile is required for agt fix, agt feature, and agt refactor. --repo does not select a language or a test command.
+agt feature and agt refactor send a verification contract object. --contract-file is read by this client. The daemon does not open a path from the request. Repair does not take a contract. Ask and plan stay read-only.
 agt profile detect prints a suggestion and does not start a run.
---provider defaults to AGT_PROVIDER. --model checks AGT_MODEL_NAME on agtd and does not call a hosted model.
+--provider defaults to AGT_PROVIDER. --model checks the active configuration's model name and does not call a model.
+agt model list and agt model select choose a daemon configuration. They do not call a model. A named configuration does not fall back to a hosted endpoint.
+agt agent list separates model API adapters from Codex and Claude. It does not start either CLI. agt agent run is unavailable. agt agent ask is a prompt-only Codex app-server turn and does not start without --authorize-live. It does not send a prompt when the permission-profile preflight can read outside the snapshot, write, or use the network, or when shell_tool stays enabled. The request is limited to five minutes.
 The fake provider is a labelled scripted demo, not a live model.
 The control plane is agtd. agt starts it when that binary sits beside agt and the daemon identity matches this client.
 agt sends the local token from AGT_TOKEN or $AGT_DATA_DIR/auth.token. GET /healthz and GET /v1/identity do not use the token.
@@ -111,7 +130,19 @@ agt doctor names the next command when Docker, Postgres, the token, the listen a
 }
 
 func fix(args []string) int {
-	fs := flag.NewFlagSet("fix", flag.ContinueOnError)
+	return submitTask("fix", verify.TaskRepair, args)
+}
+
+func featureCmd(args []string) int {
+	return submitTask("feature", verify.TaskFeature, args)
+}
+
+func refactorCmd(args []string) int {
+	return submitTask("refactor", verify.TaskRefactor, args)
+}
+
+func submitTask(name, task string, args []string) int {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	repoFlag := fs.String("repo", "", "repository to copy into a run worktree")
 	providerFlag := fs.String("provider", "", "fake or openai; defaults to AGT_PROVIDER")
@@ -120,19 +151,26 @@ func fix(args []string) int {
 	server := fs.String("server", "", "agtd base URL")
 	modelFlag := fs.String("model", "", "require this AGT_MODEL_NAME on agtd")
 	asJSON := fs.Bool("json", false, "print events as JSON")
+	contractJSON := fs.String("contract-json", "", "verification contract JSON object")
+	contractFile := fs.String("contract-file", "", "verification contract file read by this client")
 	pf := addProfileFlags(fs)
 	if err := fs.Parse(reorderFlags(args, runValueFlags(true))); err != nil {
 		return 2
 	}
 	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if goal == "" || *repoFlag == "" {
-		fmt.Fprintln(os.Stderr, "fix requires a goal and --repo")
+		fmt.Fprintf(os.Stderr, "%s requires a goal and --repo\n", name)
+		return 2
+	}
+	contract, err := loadContract(task, *contractJSON, *contractFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	prof, err := pf.request()
 	if err != nil {
 		if errors.Is(err, errProfileRequired) {
-			fmt.Fprintln(os.Stderr, "fix requires --profile. Passing --repo does not select a language or a test command.")
+			fmt.Fprintf(os.Stderr, "%s requires --profile. Passing --repo does not select a language or a test command.\n", name)
 			printSuggestion(*repoFlag)
 		} else {
 			fmt.Fprintln(os.Stderr, err)
@@ -155,7 +193,10 @@ func fix(args []string) int {
 	}
 	body := map[string]any{
 		"goal": goal, "repo_path": repo, "provider": provider, "budget_cents": *budget,
-		"profile": profilePayload(prof),
+		"profile": profilePayload(prof), "task_type": task,
+	}
+	if len(contract) > 0 {
+		body["contract"] = contract
 	}
 	if script != "" {
 		body["script_path"] = script
@@ -175,6 +216,36 @@ func fix(args []string) int {
 	}
 	fmt.Printf("run %s\n", created.RunID)
 	return attach(base, created.RunID, *asJSON)
+}
+
+// loadContract reads a contract for this client. A repair command omits it.
+// The daemon receives the object and does not open a host path.
+func loadContract(task, raw, path string) (json.RawMessage, error) {
+	raw = strings.TrimSpace(raw)
+	path = strings.TrimSpace(path)
+	if raw != "" && path != "" {
+		return nil, fmt.Errorf("pass only one of --contract-json and --contract-file")
+	}
+	if task == verify.TaskRepair || task == "" {
+		if raw != "" || path != "" {
+			return nil, fmt.Errorf("repair does not take a verification contract")
+		}
+		return nil, nil
+	}
+	if raw == "" && path == "" {
+		return nil, fmt.Errorf("%s requires a verification contract", task)
+	}
+	if path != "" {
+		return verify.ReadLocal(path)
+	}
+	trimmed := bytes.TrimSpace([]byte(raw))
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, fmt.Errorf("contract must be an object")
+	}
+	if !json.Valid(trimmed) {
+		return nil, fmt.Errorf("contract JSON is invalid")
+	}
+	return json.RawMessage(trimmed), nil
 }
 
 func runCmd(args []string) int {
@@ -458,11 +529,21 @@ func runInputs(providerFlag, repoFlag, scriptFlag string) (provider, repo, scrip
 }
 
 func postJSON(url string, body any, dest any) error {
+	return postJSONTimeout(url, body, dest, 0)
+}
+
+func postJSONTimeout(url string, body any, dest any, timeout time.Duration) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}

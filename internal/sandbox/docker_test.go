@@ -50,7 +50,7 @@ func TestSandboxRunsTestsAndStaysClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := &sandbox.Runner{Images: profile.Images{Python: image}, ExtraLabel: "agt-test=sandbox"}
+	runner := &sandbox.Runner{Images: profile.Images{Python: image}, ExtraLabel: "agt-test=sandbox", Namespace: "sandboxtest"}
 	py, err := profile.Resolve(profile.Request{
 		Name: profile.NamePython,
 		Argv: []string{"python", "-m", "unittest", "tests.test_retry"},

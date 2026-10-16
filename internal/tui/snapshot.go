@@ -43,41 +43,48 @@ type Approval struct {
 
 // Snapshot is the session the renderer draws.
 type Snapshot struct {
-	Width       int
-	Height      int
-	Color       bool
-	Example     bool
-	Repo        string
-	Model       string
-	Mode        string
-	RunID       string
-	RunState    string
-	Profile     string
-	Network     string
-	SpentMicros int64
-	BudgetCents int
-	Messages    []Message
-	Tools       []ToolLine
-	Selected    int
-	Approval    *Approval
-	Diff        string
-	Digest      string
-	View        string
-	Prompt      string
-	Placeholder string
-	LiveInput   string
-	Notice      string
-	DaemonErr   string
-	Scroll      int
-	Scene       string
-	ShowIDs     bool
-	Focus       string
-	LastSeq     int64
-	Pending     []PendingLine
-	Picker      []string
-	PickerAt    int
-	openAssist  bool
-	help        bool
+	Width        int
+	Height       int
+	Color        bool
+	Example      bool
+	Repo         string
+	Model        string
+	ModelConfig  string
+	Scripted     bool
+	Mode         string
+	Task         string
+	Verification string
+	Checks       []string
+	Failures     []string
+	RunID        string
+	RunState     string
+	Profile      string
+	Network      string
+	SpentMicros  int64
+	BudgetCents  int
+	Messages     []Message
+	Tools        []ToolLine
+	Selected     int
+	Approval     *Approval
+	Diff         string
+	Digest       string
+	View         string
+	Prompt       string
+	Placeholder  string
+	LiveInput    string
+	Notice       string
+	DaemonErr    string
+	Scroll       int
+	Scene        string
+	ShowIDs      bool
+	Focus        string
+	LastSeq      int64
+	Pending      []PendingLine
+	Picker       []string
+	PickerAt     int
+	PickerKind   string
+	openAssist   bool
+	help         bool
 }
 
 // Apply folds one daemon event into the session.
@@ -128,9 +135,29 @@ func Apply(s Snapshot, ev client.Event) Snapshot {
 	case "run.succeeded":
 		s.RunState = "SUCCEEDED"
 		s.Approval = nil
+	case "run.created":
+		if task := str(payload["task_type"]); task != "" {
+			s.Task = task
+		}
+	case "contract.baseline", "verification.recorded":
+		if outcome := str(payload["outcome"]); outcome != "" {
+			s.Verification = outcome
+		}
+		if summary := str(payload["summary"]); summary != "" {
+			s.Messages = append(s.Messages, Message{Role: "verifier", Text: summary})
+		}
+		if _, ok := payload["checks"]; ok {
+			s.Checks = stringList(payload["checks"])
+		}
+		if _, ok := payload["failures"]; ok {
+			s.Failures = stringList(payload["failures"])
+		}
 	case "run.failed":
 		s.RunState = "FAILED_TERMINAL"
 		s.Notice = str(payload["reason"])
+		if outcome := str(payload["outcome"]); outcome != "" {
+			s.Verification = outcome
+		}
 	case "budget.paused":
 		s.RunState = "PAUSED_BUDGET"
 		s.Notice = "Paused because the reserved cost would exceed the estimate. This is not a hard dollar cap when prices are zero."
@@ -174,6 +201,20 @@ func (s *Snapshot) finishTool(name, exit, output string) {
 		}
 	}
 	s.Tools = append(s.Tools, ToolLine{Name: name, State: "finished", Exit: exit, Output: output})
+}
+
+func stringList(v any) []string {
+	items, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, item := range items {
+		if line := str(item); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func str(v any) string {

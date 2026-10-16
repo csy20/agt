@@ -320,7 +320,7 @@ func TestSessionSurvivesDaemonRestart(t *testing.T) {
 	data := t.TempDir()
 	var current *exec.Cmd
 	t.Cleanup(func() { stopProcess(current) })
-	current = startAgtd(t, agtdBin, data, addr)
+	current = startAgtd(t, agtdBin, data, addr, testutil.URL(st))
 	base := "http://" + addr
 	created := decodeJSON(t, postJSON(t, base+"/v1/sessions", map[string]any{"repo_path": repo, "title": "restart"}, ""))
 	if created.status != http.StatusCreated {
@@ -340,7 +340,7 @@ func TestSessionSurvivesDaemonRestart(t *testing.T) {
 	waitHTTPState(t, base, submitted.runID, "PAUSED_BUDGET")
 	stopProcess(current)
 	current = nil
-	current = startAgtd(t, agtdBin, data, addr)
+	current = startAgtd(t, agtdBin, data, addr, testutil.URL(st))
 
 	opened := decodeJSON(t, postJSON(t, base+"/v1/sessions/"+sessionID+"/open", map[string]any{"repo_path": repo}, ""))
 	if opened.status != http.StatusOK || opened.body["active_run_id"] != submitted.runID {

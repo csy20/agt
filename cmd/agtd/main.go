@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -66,11 +65,33 @@ func run() int {
 		slog.Error("migrate", "err", err)
 		return 1
 	}
+	catalog := config.CatalogFrom(cfg)
+	st.Redact = func(text string) string {
+		return catalog.Hide(text, func(name string) string {
+			if v := os.Getenv(name); v != "" {
+				return v
+			}
+			if name == "AGT_MODEL_API_KEY" {
+				return cfg.ModelAPIKey
+			}
+			return ""
+		})
+	}
+	selected := config.ReadSelectedModel(cfg.DataDir)
+	if selected == "" {
+		selected = config.DefaultModelName
+	}
+	for _, item := range catalog.Public(selected, os.Getenv) {
+		if item.Valid {
+			continue
+		}
+		slog.Warn("model configuration", "name", item.Name, "problem", item.Problem)
+	}
 	if msg := diag.ModelConfigWarning(cfg.Provider, cfg.ModelAPIKey, cfg.ModelName, cfg.ModelBaseURL); msg != "" {
 		slog.Warn(msg)
 	}
 	// Tests run only in this Docker runner. There is no host-process fallback.
-	runner := &sandbox.Runner{Images: cfg.ProfileImages()}
+	runner := &sandbox.Runner{Images: cfg.ProfileImages(), Namespace: sandbox.NamespaceFor(cfg.DataDir)}
 	checkCtx, cancelCheck := context.WithTimeout(ctx, 20*time.Second)
 	err = runner.Preflight(checkCtx)
 	cancelCheck()
@@ -104,20 +125,7 @@ func run() int {
 		},
 		Tel: telemetry.New(cfg.OTLPEndpoint),
 		ModelFor: func(current store.Run) (model.Provider, error) {
-			switch current.Provider {
-			case "fake", "":
-				script, err := model.ParseScript(current.ScriptJSON)
-				if err != nil {
-					return nil, err
-				}
-				fake := model.NewFake(script)
-				fake.ModelName = cfg.ModelName
-				return fake, nil
-			case "openai":
-				return model.NewOpenAI(cfg.ModelBaseURL, cfg.ModelAPIKey, cfg.ModelName), nil
-			default:
-				return nil, fmt.Errorf("unknown provider %s", current.Provider)
-			}
+			return orch.ProviderFor(current, cfg)
 		},
 		NewWorkspace: func(current store.Run) (workspace.Handle, error) {
 			prof, err := profile.Parse(current.ProfileJSON)
@@ -127,6 +135,11 @@ func run() int {
 			dir := workspace.NewDir(current.Worktree, orch.BasePath(current.Worktree), func(ctx context.Context, root string) (string, string, int, error) {
 				return runner.RunProfile(ctx, root, current.ID, prof)
 			})
+			dir.CheckFn = func(ctx context.Context, root string, argv []string) (string, string, int, error) {
+				clone := prof
+				clone.Argv = append([]string(nil), argv...)
+				return runner.RunProfile(ctx, root, current.ID, clone)
+			}
 			dir.CloseFn = func(ctx context.Context) error {
 				return runner.Destroy(ctx, current.ID)
 			}
@@ -157,7 +170,7 @@ func run() int {
 		defer cancel()
 		_ = httpServer.Shutdown(shut)
 	}()
-	slog.Info("listening", "addr", cfg.ListenAddr, "data_dir", cfg.DataDir, "log", filepath.Join(cfg.DataDir, "agtd.log"), "version", version.Product)
+	slog.Info("listening", "addr", cfg.ListenAddr, "data_dir", cfg.DataDir, "log", filepath.Join(cfg.DataDir, "agtd.log"), "version", version.Product, "contract", version.Contract, "build", version.BuildID())
 	if err := httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("http", "err", err)
 		return 1

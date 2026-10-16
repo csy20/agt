@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/csy20/agt/internal/agent"
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/id"
 	"github.com/csy20/agt/internal/model"
@@ -24,6 +25,7 @@ import (
 	"github.com/csy20/agt/internal/profile"
 	"github.com/csy20/agt/internal/run"
 	"github.com/csy20/agt/internal/store"
+	"github.com/csy20/agt/internal/verify"
 	"github.com/csy20/agt/internal/version"
 	"github.com/csy20/agt/internal/workspace"
 )
@@ -35,9 +37,30 @@ type Server struct {
 	// Cleanup removes abandoned sandbox containers. The API does not import
 	// the sandbox package; the daemon injects this.
 	Cleanup func(context.Context) (int, error)
+	// AgentProbe lists coding-agent executables. Nil runs `--version` only.
+	// It does not start a Codex or Claude task.
+	AgentProbe agent.VersionFunc
+	// CodexCommand replaces the codex executable for tests. Empty uses codex.
+	// It does not enable mutation.
+	CodexCommand []string
 }
 
 func New(st *store.Store, cfg config.Config, token string) *Server {
+	if st != nil && st.Redact == nil {
+		catalog := config.CatalogFrom(cfg)
+		key := cfg.ModelAPIKey
+		st.Redact = func(text string) string {
+			return catalog.Hide(text, func(name string) string {
+				if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+					return v
+				}
+				if name == "AGT_MODEL_API_KEY" {
+					return key
+				}
+				return ""
+			})
+		}
+	}
 	return &Server{Store: st, Config: cfg, Token: token}
 }
 
@@ -45,6 +68,10 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /v1/identity", s.identity)
+	mux.HandleFunc("GET /v1/models", s.listModels)
+	mux.HandleFunc("GET /v1/agents", s.listAgents)
+	mux.HandleFunc("POST /v1/agents/codex/ask", s.codexAsk)
+	mux.HandleFunc("POST /v1/models/select", s.selectModel)
 	mux.HandleFunc("POST /v1/runs", s.createRun)
 	mux.HandleFunc("GET /v1/runs", s.listRuns)
 	mux.HandleFunc("GET /v1/runs/{id}", s.getRun)
@@ -65,6 +92,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}", s.readSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/open", s.openSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/messages", s.submitSession)
+	mux.HandleFunc("POST /v1/sessions/{id}/model", s.selectSessionModel)
 	return s.guard(mux)
 }
 
@@ -125,6 +153,14 @@ type createRequest struct {
 	// Interaction is agent, ask, or plan. Empty means agent.
 	// ask and plan are read-only. PLANNING remains the normal repair state.
 	Interaction string `json:"interaction"`
+	// TaskType is repair, feature, or refactor. Empty means repair.
+	// It is not risk_level, and it is not the interaction mode.
+	TaskType string `json:"task_type"`
+	// Contract is the verification object. A string, including a filesystem
+	// path, is rejected and is not opened.
+	Contract json.RawMessage `json:"contract"`
+	// ModelConfig names a daemon configuration. The client does not send an endpoint or a key.
+	ModelConfig string `json:"model_config"`
 }
 
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +169,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "read body")
 		return
 	}
-	in, code, msg := s.prepareRun(body)
+	in, code, msg := s.prepareRun(body, "")
 	if code != 0 {
 		writeError(w, code, msg)
 		return
@@ -162,9 +198,12 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 
 // prepareRun validates a create body. A zero status means the input is ready.
 // Idempotency and session linkage are applied by the caller.
-func (s *Server) prepareRun(body []byte) (store.CreateInput, int, string) {
+func (s *Server) prepareRun(body []byte, preferred string) (store.CreateInput, int, string) {
 	if imageField(body) {
 		return store.CreateInput{}, http.StatusBadRequest, "image is not accepted; the daemon selects the profile image"
+	}
+	if msg := forbiddenModelFields(body); msg != "" {
+		return store.CreateInput{}, http.StatusBadRequest, msg
 	}
 	var req createRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -187,8 +226,9 @@ func (s *Server) prepareRun(body []byte) (store.CreateInput, int, string) {
 		}
 	}
 	provider := req.Provider
-	if provider == "" {
-		provider = s.Config.Provider
+	chosen, provider, err := s.resolveForCreate(req.ModelConfig, provider, preferred)
+	if err != nil {
+		return store.CreateInput{}, http.StatusBadRequest, s.hide(err.Error())
 	}
 	if provider != "fake" && provider != "openai" {
 		return store.CreateInput{}, http.StatusBadRequest, "provider must be fake or openai"
@@ -216,6 +256,10 @@ func (s *Server) prepareRun(body []byte) (store.CreateInput, int, string) {
 	}
 	var script json.RawMessage
 	scriptPath := ""
+	clientScript := strings.TrimSpace(req.ScriptPath) != ""
+	if provider == "fake" && !clientScript && chosen.ScriptPath != "" {
+		req.ScriptPath = chosen.ScriptPath
+	}
 	if provider == "fake" {
 		if req.ScriptPath == "" {
 			return store.CreateInput{}, http.StatusBadRequest, "fake provider requires script_path"
@@ -245,9 +289,6 @@ func (s *Server) prepareRun(body []byte) (store.CreateInput, int, string) {
 		}
 		script = encoded
 	}
-	if provider == "openai" && (s.Config.ModelName == "" || (s.Config.ModelAPIKey == "" && !model.LoopbackURL(s.Config.ModelBaseURL))) {
-		return store.CreateInput{}, http.StatusBadRequest, "AGT_MODEL_NAME is required for the openai provider. AGT_MODEL_API_KEY is required unless AGT_MODEL_BASE_URL is a loopback URL"
-	}
 	profReq, err := decodeProfile(req.Profile)
 	if err != nil {
 		return store.CreateInput{}, http.StatusBadRequest, err.Error()
@@ -265,21 +306,41 @@ func (s *Server) prepareRun(body []byte) (store.CreateInput, int, string) {
 	if !policy.ValidInteraction(interaction) {
 		return store.CreateInput{}, http.StatusBadRequest, "interaction must be agent, ask, or plan"
 	}
-	hash := requestHash(req.Goal, repo, budget, maxSteps, wall, provider, script, profileJSON, interaction)
-	return store.CreateInput{
-		RequestHash:  hash,
-		Goal:         req.Goal,
-		RepoPath:     repo,
-		BudgetCents:  budget,
-		MaxSteps:     maxSteps,
-		WallSeconds:  wall,
-		AgentVersion: version.Compute(images.Python, images.Go, images.Node),
-		Provider:     provider,
-		ScriptPath:   scriptPath,
-		ScriptJSON:   script,
-		ProfileJSON:  profileJSON,
-		Interaction:  interaction,
-	}, 0, ""
+	task := verify.NormalizeTask(req.TaskType)
+	if !verify.ValidTask(task) {
+		return store.CreateInput{}, http.StatusBadRequest, "task_type must be repair, feature, or refactor"
+	}
+	if (interaction == "ask" || interaction == "plan") && (task != verify.TaskRepair || contractPresent(req.Contract)) {
+		return store.CreateInput{}, http.StatusBadRequest, "ask and plan are read-only and do not take a verification contract"
+	}
+	_, canonical, digest, err := verify.Parse(req.Contract, task, resolved.Name)
+	if err != nil {
+		return store.CreateInput{}, http.StatusBadRequest, err.Error()
+	}
+	in := store.CreateInput{
+		Goal:           req.Goal,
+		RepoPath:       repo,
+		BudgetCents:    budget,
+		MaxSteps:       maxSteps,
+		WallSeconds:    wall,
+		AgentVersion:   version.Compute(images.Python, images.Go, images.Node),
+		Provider:       provider,
+		ScriptPath:     scriptPath,
+		ScriptJSON:     script,
+		ProfileJSON:    profileJSON,
+		Interaction:    interaction,
+		TaskType:       task,
+		ContractJSON:   canonical,
+		ContractDigest: digest,
+	}
+	s.applyResolved(&in, chosen, clientScript)
+	in.RequestHash = requestHash(in.Goal, in.RepoPath, in.BudgetCents, in.MaxSteps, in.WallSeconds, in.Provider, in.ModelConfig, in.ModelName, in.ScriptJSON, in.ProfileJSON, in.Interaction, in.TaskType, in.ContractJSON)
+	return in, 0, ""
+}
+
+func contractPresent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && string(trimmed) != "null"
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
@@ -458,9 +519,11 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
-func requestHash(goal, repo string, budget, steps, wall int, provider string, script, profileJSON []byte, interaction string) string {
+func requestHash(goal, repo string, budget, steps, wall int, provider, modelConfig, modelName string, script, profileJSON []byte, interaction, task string, contract []byte) string {
 	sum := sha256.New()
-	fmt.Fprintf(sum, "%s\n%s\n%d\n%d\n%d\n%s\n%s\n", goal, repo, budget, steps, wall, provider, interaction)
+	fmt.Fprintf(sum, "%s\n%s\n%d\n%d\n%d\n%s\n%s\n%s\n%s\n%s\n", goal, repo, budget, steps, wall, provider, interaction, modelConfig, modelName, verify.NormalizeTask(task))
+	sum.Write(contract)
+	sum.Write([]byte("\n"))
 	sum.Write(script)
 	sum.Write([]byte("\n"))
 	sum.Write(profileJSON)
@@ -504,28 +567,43 @@ func decodeProfile(raw json.RawMessage) (profile.Request, error) {
 }
 
 type runViewBody struct {
-	ID           string          `json:"id"`
-	Goal         string          `json:"goal"`
-	RepoPath     string          `json:"repo_path"`
-	Worktree     string          `json:"worktree,omitempty"`
-	State        run.State       `json:"state"`
-	StateVersion int64           `json:"state_version"`
-	BudgetCents  int             `json:"budget_cents"`
-	SpentMicros  int64           `json:"spent_micros"`
-	AgentVersion string          `json:"agent_version"`
-	TraceID      string          `json:"trace_id"`
-	Provider     string          `json:"provider"`
-	StepCount    int             `json:"step_count"`
-	MaxSteps     int             `json:"max_steps"`
-	UsageMicros  int64           `json:"usage_micros"`
-	Error        string          `json:"error,omitempty"`
-	Interaction  string          `json:"interaction,omitempty"`
-	SessionID    string          `json:"session_id,omitempty"`
-	Plan         json.RawMessage `json:"plan,omitempty"`
-	Result       json.RawMessage `json:"result,omitempty"`
-	Profile      json.RawMessage `json:"profile,omitempty"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	ID                  string          `json:"id"`
+	Goal                string          `json:"goal"`
+	RepoPath            string          `json:"repo_path"`
+	Worktree            string          `json:"worktree,omitempty"`
+	State               run.State       `json:"state"`
+	StateVersion        int64           `json:"state_version"`
+	BudgetCents         int             `json:"budget_cents"`
+	SpentMicros         int64           `json:"spent_micros"`
+	AgentVersion        string          `json:"agent_version"`
+	TraceID             string          `json:"trace_id"`
+	Provider            string          `json:"provider"`
+	StepCount           int             `json:"step_count"`
+	MaxSteps            int             `json:"max_steps"`
+	UsageMicros         int64           `json:"usage_micros"`
+	Error               string          `json:"error,omitempty"`
+	Interaction         string          `json:"interaction,omitempty"`
+	SessionID           string          `json:"session_id,omitempty"`
+	ModelConfig         string          `json:"model_config,omitempty"`
+	ModelName           string          `json:"model_name,omitempty"`
+	ModelEndpoint       string          `json:"model_endpoint,omitempty"`
+	Scripted            bool            `json:"scripted"`
+	InputPerMillion     int64           `json:"input_per_million"`
+	OutputPerMillion    int64           `json:"output_per_million"`
+	PricingRecorded     bool            `json:"pricing_recorded"`
+	CredentialEnv       string          `json:"credential_env,omitempty"`
+	TaskType            string          `json:"task_type,omitempty"`
+	Contract            json.RawMessage `json:"contract,omitempty"`
+	ContractDigest      string          `json:"contract_digest,omitempty"`
+	Baseline            json.RawMessage `json:"baseline,omitempty"`
+	Final               json.RawMessage `json:"final,omitempty"`
+	VerificationOutcome string          `json:"verification_outcome,omitempty"`
+	VerificationDigest  string          `json:"verification_digest,omitempty"`
+	Plan                json.RawMessage `json:"plan,omitempty"`
+	Result              json.RawMessage `json:"result,omitempty"`
+	Profile             json.RawMessage `json:"profile,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UpdatedAt           time.Time       `json:"updated_at"`
 }
 
 func (s *Server) present(ctx context.Context, current store.Run) (runViewBody, error) {
@@ -535,6 +613,11 @@ func (s *Server) present(ctx context.Context, current store.Run) (runViewBody, e
 		return runViewBody{}, err
 	}
 	view.UsageMicros = total
+	view.Goal = s.hide(view.Goal)
+	view.Error = s.hide(view.Error)
+	view.ModelName = s.hide(view.ModelName)
+	view.ModelEndpoint = s.hide(view.ModelEndpoint)
+	view.CredentialEnv = s.hide(view.CredentialEnv)
 	return view, nil
 }
 
@@ -547,6 +630,21 @@ func runView(current store.Run) runViewBody {
 		Error: current.Error, Interaction: current.Interaction, SessionID: current.SessionID,
 		CreatedAt: current.CreatedAt, UpdatedAt: current.UpdatedAt,
 	}
+	view.ModelConfig = current.ModelConfig
+	view.ModelName = current.ModelName
+	view.ModelEndpoint = current.ModelEndpoint
+	view.Scripted = current.Provider == "fake"
+	view.InputPerMillion = current.InputPerMillion
+	view.OutputPerMillion = current.OutputPerMillion
+	view.PricingRecorded = current.PricingRecorded
+	view.CredentialEnv = current.CredentialEnv
+	view.TaskType = current.TaskType
+	view.ContractDigest = current.ContractDigest
+	view.VerificationOutcome = current.VerificationOutcome
+	view.VerificationDigest = current.VerificationDigest
+	view.Contract = jsonObject(current.ContractJSON)
+	view.Baseline = jsonObject(current.BaselineJSON)
+	view.Final = jsonObject(current.FinalJSON)
 	if len(current.Plan) > 0 && string(current.Plan) != "null" {
 		view.Plan = current.Plan
 	}
@@ -560,6 +658,14 @@ func runView(current store.Run) runViewBody {
 		}
 	}
 	return view
+}
+
+func jsonObject(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil
+	}
+	return raw
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

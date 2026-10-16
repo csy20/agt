@@ -396,6 +396,16 @@ func aliasOK(name, alias string) error {
 	}
 }
 
+// ValidateArgv checks one argv against a profile name. It does not read a
+// path, accept an image, or start a shell. typescript is the javascript profile.
+func ValidateArgv(name string, argv []string) error {
+	canonicalName, _, err := canonical(name)
+	if err != nil {
+		return err
+	}
+	return validateArgv(canonicalName, argv)
+}
+
 func validateArgv(name string, argv []string) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("test argv is required")

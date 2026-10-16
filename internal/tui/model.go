@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/csy20/agt/internal/client"
 	"github.com/csy20/agt/internal/setup"
+	"github.com/csy20/agt/internal/verify"
 )
 
 // Options selects the session. Demo draws example data and does not call a daemon.
@@ -32,25 +33,29 @@ type Options struct {
 }
 
 type model struct {
-	opts      Options
-	client    *client.Client
-	identity  client.Identity
-	snap      Snapshot
-	input     textarea.Model
-	history   []string
-	histAt    int
-	after     int64
-	events    <-chan tea.Msg
-	cancel    context.CancelFunc
-	mode      string
-	applied   bool
-	frames    []Frame
-	ready     bool
-	errText   string
-	focus     focus
-	gen       int
-	sessionID string
-	picker    []pickerItem
+	opts         Options
+	client       *client.Client
+	identity     client.Identity
+	snap         Snapshot
+	input        textarea.Model
+	history      []string
+	histAt       int
+	after        int64
+	events       <-chan tea.Msg
+	cancel       context.CancelFunc
+	mode         string
+	applied      bool
+	frames       []Frame
+	ready        bool
+	errText      string
+	focus        focus
+	gen          int
+	sessionID    string
+	picker       []pickerItem
+	pickerKind   string
+	models       []client.ModelInfo
+	modelConfig  string
+	modelAdapter string
 }
 
 type focus int
@@ -140,13 +145,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return next, cmd
 	case client.Identity:
 		m.identity = msg
-		if m.identity.Model != "" {
-			m.snap.Model = m.identity.Model
+		if m.modelConfig == "" {
+			m.modelConfig = msg.ModelConfig
+			m.modelAdapter = msg.Provider
+			m.snap.ModelConfig = msg.ModelConfig
+			m.snap.Scripted = msg.Scripted
+			if msg.Model != "" {
+				m.snap.Model = msg.Model
+			}
 		}
 		if m.opts.Provider == "" {
-			m.opts.Provider = m.identity.Provider
+			m.opts.Provider = msg.Provider
 		}
 		return m, nil
+	case modelListMsg:
+		if msg.err != nil {
+			m.errText = msg.err.Error()
+			return m, nil
+		}
+		next, cmd := m.showModels(msg.configs)
+		return next, cmd
+	case modelSelectedMsg:
+		return m.acceptModel(msg)
 	case sessionListMsg:
 		if msg.err != nil {
 			m.errText = msg.err.Error()
@@ -292,6 +312,13 @@ func (m model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "esc":
+		if m.pickerKind == "model" && m.snap.View == "picker" {
+			m.snap.View = "session"
+			m.pickerKind = ""
+			m.snap.PickerKind = ""
+			m.focus = focusInput
+			return m, nil
+		}
 		if m.focus != focusInput {
 			m.focus = focusInput
 			return m, nil
@@ -425,7 +452,7 @@ func (m model) submit(text string) (tea.Model, tea.Cmd) {
 		m.snap.Notice = "Example session. That prompt was not sent. A follow-up would start a fresh snapshot."
 		return m, nil
 	}
-	return m.startRun(text, m.mode)
+	return m.startRun(text, m.mode, "", nil)
 }
 
 func (m model) slash(name, rest string) (tea.Model, tea.Cmd) {
@@ -445,7 +472,7 @@ func (m model) slash(name, rest string) (tea.Model, tea.Cmd) {
 			m.snap.Notice = "Example session. " + m.snap.Notice
 			return m, nil
 		}
-		return m.startRun(rest, name)
+		return m.startRun(rest, name, "", nil)
 	case "fix":
 		m.mode = "agent"
 		m.snap.Mode = "agent"
@@ -457,7 +484,30 @@ func (m model) slash(name, rest string) (tea.Model, tea.Cmd) {
 			m.snap.Notice = "Example session. /fix was not sent."
 			return m, nil
 		}
-		return m.startRun(rest, "agent")
+		return m.startRun(rest, "agent", "", nil)
+	case "feature", "refactor":
+		m.mode = "agent"
+		m.snap.Mode = "agent"
+		m.snap.Task = name
+		if rest == "" {
+			m.snap.Notice = "/" + name + " needs a contract file and a goal. Example: /" + name + " contract.json describe the change. The daemon does not read a host path."
+			return m, nil
+		}
+		if m.opts.Demo {
+			m.snap.Notice = "Example session. /" + name + " was not sent."
+			return m, nil
+		}
+		path, goal, err := SplitContractArg(rest)
+		if err != nil {
+			m.errText = err.Error()
+			return m, nil
+		}
+		raw, err := verify.ReadLocal(path)
+		if err != nil {
+			m.errText = err.Error()
+			return m, nil
+		}
+		return m.startRun(goal, "agent", name, raw)
 	case "diff":
 		m.snap.View = "diff"
 		if m.opts.Demo {
@@ -486,16 +536,18 @@ func (m model) slash(name, rest string) (tea.Model, tea.Cmd) {
 		m.snap.Notice = "The confirm line is focused. y posts the full digest. n leaves the repository unchanged. Composer text does not apply."
 		return m, nil
 	case "model":
-		current := m.snap.Model
-		if current == "" {
-			current = m.identity.Model
-		}
-		if rest == "" || rest == current {
-			m.snap.Notice = "agtd model is " + emptyAs(current, "unset") + ". --model checks that name. It does not switch models. Set AGT_MODEL_NAME and restart agtd."
+		if m.opts.Demo {
+			m.snap.Notice = "Example session. /model was not sent. No inference request was made."
 			return m, nil
 		}
-		m.errText = "agtd model is " + emptyAs(current, "unset") + " and /model is " + rest + ". This session does not switch models. Set AGT_MODEL_NAME and restart agtd."
-		return m, nil
+		if m.client == nil {
+			m.errText = emptyAs(m.opts.DaemonErr, "agtd is not connected. Run agt doctor.")
+			return m, nil
+		}
+		if rest != "" {
+			return m, m.selectModelName(rest)
+		}
+		return m, m.loadModels()
 	case "resume":
 		return m.lifecycle("resume")
 	case "cancel":
@@ -543,7 +595,7 @@ func (m model) confirmSetup(rest string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) startRun(text, mode string) (tea.Model, tea.Cmd) {
+func (m model) startRun(text, mode, task string, contract json.RawMessage) (tea.Model, tea.Cmd) {
 	if m.client == nil {
 		m.errText = emptyAs(m.opts.DaemonErr, "agtd is not connected. Run agt doctor.")
 		return m, nil
@@ -564,13 +616,16 @@ func (m model) startRun(text, mode string) (tea.Model, tea.Cmd) {
 	if provider == "" {
 		provider = m.identity.Provider
 	}
-	if provider == "fake" && m.opts.Script == "" {
+	if m.modelConfig == "" && provider == "fake" && m.opts.Script == "" {
 		m.errText = "agtd provider is fake. Pass --script to agt tui, or start agtd with the openai provider. This session does not invent a script."
 		return m, nil
 	}
 	m.snap.Mode = mode
 	m.mode = mode
-	return m, m.submitSession(goal, mode, newClientMessageID())
+	if task != "" {
+		m.snap.Task = task
+	}
+	return m, m.submitSession(goal, mode, task, contract, newClientMessageID())
 }
 
 func (m model) UpdateCreated(msg client.Created) (tea.Model, tea.Cmd) {

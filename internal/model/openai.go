@@ -64,7 +64,8 @@ func LoopbackURL(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (c *OpenAI) validate() error {
+// Validate checks the recorded endpoint and model before any request is sent.
+func (c *OpenAI) Validate() error {
 	if strings.TrimSpace(c.Model) == "" {
 		return fmt.Errorf("openai provider requires AGT_MODEL_NAME")
 	}
@@ -160,7 +161,7 @@ type streamChunk struct {
 }
 
 func (c *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
-	if err := c.validate(); err != nil {
+	if err := c.Validate(); err != nil {
 		return Response{}, err
 	}
 	messages, err := c.messages(req)

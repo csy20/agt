@@ -93,6 +93,10 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "digest does not match the run artifact")
 		return
 	}
+	if current.VerificationDigest != "" && current.VerificationDigest != art.Digest {
+		writeError(w, http.StatusConflict, "verification digest does not match the run artifact")
+		return
+	}
 	if s.Config.DataDir == "" {
 		writeError(w, http.StatusInternalServerError, "data directory is not configured")
 		return

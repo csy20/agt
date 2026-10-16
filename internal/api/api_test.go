@@ -39,8 +39,11 @@ func TestHealthIdempotencyAndOpenAIGuard(t *testing.T) {
 	if health.StatusCode != http.StatusOK || string(healthBody) != "ok\n" {
 		t.Fatalf("health %d %q", health.StatusCode, healthBody)
 	}
-	if health.Header.Get(version.ProductHeader) != version.Name || health.Header.Get(version.VersionHeader) != version.Product {
+	if health.Header.Get(version.ProductHeader) != version.Name || health.Header.Get(version.VersionHeader) != version.Product || health.Header.Get(version.ContractHeader) != version.Contract {
 		t.Fatalf("health identity %v", health.Header)
+	}
+	if !strings.Contains(health.Header.Get(version.CapabilitiesHeader), "sessions") || !strings.Contains(health.Header.Get(version.CapabilitiesHeader), "models") {
+		t.Fatalf("health capabilities %v", health.Header)
 	}
 
 	body := map[string]any{

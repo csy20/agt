@@ -20,13 +20,37 @@ func ParseSlash(input string) (name, rest string, ok bool) {
 	body, rest, _ := strings.Cut(strings.TrimPrefix(head, "/"), " ")
 	name = strings.ToLower(strings.TrimSpace(body))
 	rest = strings.TrimSpace(rest)
-	if tail != "" && (name == "fix" || name == "plan" || name == "ask") {
+	if tail != "" && (name == "fix" || name == "plan" || name == "ask" || name == "feature" || name == "refactor") {
 		rest = strings.TrimSpace(rest + "\n" + tail)
 	}
 	if name == "" || strings.ContainsAny(name, " \t") {
 		return "", "", false
 	}
 	return name, rest, true
+}
+
+// SplitContractArg takes the contract path from the first token and leaves the goal.
+// The client reads that file. A demo session must not call this.
+func SplitContractArg(rest string) (path, goal string, err error) {
+	line, tail, _ := strings.Cut(rest, "\n")
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", "", fmt.Errorf("a contract file and a goal are required")
+	}
+	path, goal, _ = strings.Cut(line, " ")
+	path = strings.TrimSpace(path)
+	goal = strings.TrimSpace(goal)
+	if tail != "" {
+		if goal != "" {
+			goal += "\n"
+		}
+		goal += tail
+	}
+	goal = strings.TrimSpace(goal)
+	if path == "" || goal == "" {
+		return "", "", fmt.Errorf("a contract file and a goal are required")
+	}
+	return path, goal, nil
 }
 
 // FollowUpNote tells the user that the next run does not continue an unapplied patch.

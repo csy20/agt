@@ -25,7 +25,7 @@ func TestContainerRunMountsOnlyTheWorktree(t *testing.T) {
 		CPUs:    "1",
 		PIDs:    64,
 	}
-	args, err := containerRunArgs(spec, "agt-run", work, "run_1", "1000:1000", "")
+	args, err := containerRunArgs(spec, "agt-run", work, "run_1", "1000:1000", "", "sandboxtest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +44,10 @@ func TestContainerRunMountsOnlyTheWorktree(t *testing.T) {
 		if strings.Contains(joined, banned) {
 			t.Fatalf("argv contains %q\n%s", banned, joined)
 		}
+	}
+	labels := flagValues(args, "--label")
+	if len(labels) != 2 || labels[0] != "agt-run=run_1" || labels[1] != "agt-namespace=sandboxtest" {
+		t.Fatalf("labels %q", labels)
 	}
 	assertFlag(t, args, "--network", "none")
 	assertFlag(t, args, "--tmpfs", "/tmp:rw,exec,nosuid,size=128m")

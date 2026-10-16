@@ -99,6 +99,12 @@ func status(s Snapshot) string {
 	if model == "" {
 		model = "model unset"
 	}
+	if s.ModelConfig != "" {
+		model = s.ModelConfig + " · " + model
+	}
+	if s.Scripted {
+		model = "scripted " + model
+	}
 	state := s.RunState
 	if state == "" {
 		state = "idle"
@@ -119,15 +125,26 @@ func status(s Snapshot) string {
 	if network == "" {
 		network = "none"
 	}
-	return model + " · " + state + " · " + modeNote + " · " + profile +
+	line := model + " · " + state + " · " + modeNote + " · " + profile +
 		" · network " + network + " · spent " + usage.USD(s.SpentMicros) +
 		" · estimate $" + itoa(int64(s.BudgetCents)/100) + "." + cents(s.BudgetCents)
+	if s.Task != "" {
+		line += " · task " + s.Task
+	}
+	if s.Verification != "" {
+		line += " · verification " + s.Verification
+	}
+	return line
 }
 
 func bodyLines(s Snapshot, width int) []string {
 	var lines []string
 	if s.View == "picker" {
-		lines = append(lines, wrapBlock("Sessions for this repository. Enter opens the selected row and does not start a run.", width)...)
+		intro := "Sessions for this repository. Enter opens the selected row and does not start a run."
+		if s.PickerKind == "model" {
+			intro = "Model configurations. Enter selects one and does not call a model."
+		}
+		lines = append(lines, wrapBlock(intro, width)...)
 		for i, row := range s.Picker {
 			cursor := " "
 			if i == s.PickerAt {
@@ -135,7 +152,11 @@ func bodyLines(s Snapshot, width int) []string {
 			}
 			lines = append(lines, fit(cursor+" "+row, width))
 		}
-		lines = append(lines, wrapBlock("Opening does not replay tools or apply a patch.", width)...)
+		if s.PickerKind == "model" {
+			lines = append(lines, wrapBlock("Esc leaves this list. No inference request is made.", width)...)
+		} else {
+			lines = append(lines, wrapBlock("Opening does not replay tools or apply a patch.", width)...)
+		}
 		return lines
 	}
 	for _, pending := range s.Pending {
@@ -151,7 +172,20 @@ func bodyLines(s Snapshot, width int) []string {
 		lines = append(lines, wrapBlock(note, width)...)
 	}
 	if len(s.Messages) == 0 && s.Approval == nil && s.Diff == "" && len(s.Pending) == 0 {
-		lines = append(lines, wrapBlock("Repair a failing test. /plan and /ask are read-only. /fix starts a repair run.", width)...)
+		lines = append(lines, wrapBlock("Repair a failing test. /plan and /ask are read-only. /fix starts a repair run. /feature and /refactor need a contract.", width)...)
+	}
+	if s.Task != "" || s.Verification != "" || len(s.Checks) > 0 || len(s.Failures) > 0 {
+		label := "task " + emptyAs(s.Task, "repair")
+		if s.Verification != "" {
+			label += " · verification " + s.Verification
+		}
+		lines = append(lines, paint(s, fit(label, width), "111"))
+		for _, check := range s.Checks {
+			lines = append(lines, wrapBlock("check "+check, width)...)
+		}
+		for _, failure := range s.Failures {
+			lines = append(lines, wrapBlock("failure "+failure, width)...)
+		}
 	}
 	for _, msg := range s.Messages {
 		role := msg.Role
@@ -207,11 +241,13 @@ func bodyLines(s Snapshot, width int) []string {
 func commandHelp() string {
 	return strings.Join([]string{
 		"/fix [goal]    repair run, one snapshot",
+		"/feature FILE goal   feature run. FILE is a contract this client reads.",
+		"/refactor FILE goal  refactor run. The same checks must pass before and after.",
 		"/plan [goal]   read-only plan. Writes and tests are denied.",
 		"/ask [goal]    read-only questions. Same daemon gate as /plan.",
 		"/diff          show the patch preview and digest",
 		"/apply         confirm the digest, then write the recorded repository",
-		"/model [name]  show agtd's model. This does not switch models.",
+		"/model [name]  choose a saved configuration. This does not call a model.",
 		"/resume        resume a paused run",
 		"/cancel        cancel the run. Leaving this screen does not.",
 		"/setup         confirm the profile and test command",

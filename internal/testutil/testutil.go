@@ -20,62 +20,7 @@ import (
 	"github.com/csy20/agt/internal/usage"
 	"github.com/csy20/agt/internal/version"
 	"github.com/csy20/agt/internal/workspace"
-	"github.com/jackc/pgx/v5"
 )
-
-const defaultURL = "postgres://agt:agt@127.0.0.1:54329/agt?sslmode=disable"
-
-func DatabaseURL() string {
-	if v := os.Getenv("AGT_DATABASE_URL"); v != "" {
-		return v
-	}
-	return defaultURL
-}
-
-// Open migrates a private schema and holds a session advisory lock so parallel
-// packages cannot truncate each other's rows. Cleanup order is LIFO: callers
-// that register a worker cancel after Open stop the worker before the pool
-// closes and before the lock is released.
-func Open(t *testing.T) *store.Store {
-	t.Helper()
-	url := DatabaseURL()
-	dial, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	lockConn, err := pgx.Connect(dial, url)
-	cancel()
-	if err != nil {
-		if MissingPrereq(os.Getenv("AGT_DATABASE_URL") != "") {
-			t.Fatalf("postgres: %v", err)
-		}
-		t.Skipf("postgres unreachable: %v", err)
-	}
-	// One scripted repair batch holds this lock for several minutes. Other
-	// packages wait instead of failing the integration job.
-	if _, err := lockConn.Exec(context.Background(), `SET lock_timeout = '15min'`); err != nil {
-		lockConn.Close(context.Background())
-		t.Fatalf("lock timeout: %v", err)
-	}
-	if _, err := lockConn.Exec(context.Background(), `SELECT pg_advisory_lock(8675309)`); err != nil {
-		lockConn.Close(context.Background())
-		t.Fatalf("advisory lock: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock(8675309)`)
-		lockConn.Close(context.Background())
-	})
-
-	st, err := store.Open(context.Background(), url)
-	if err != nil {
-		t.Fatalf("store: %v", err)
-	}
-	t.Cleanup(st.Close)
-	if err := st.Migrate(context.Background()); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if err := st.Reset(context.Background()); err != nil {
-		t.Fatalf("reset: %v", err)
-	}
-	return st
-}
 
 func RepoRoot(t *testing.T) string {
 	t.Helper()
@@ -136,7 +81,7 @@ func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 	images := TestImages(t)
 	eng := &Engine{Store: st, DataDir: t.TempDir(), images: images}
 	if len(images.List()) > 0 {
-		eng.Runner = &sandbox.Runner{Images: images}
+		eng.Runner = &sandbox.Runner{Images: images, Namespace: sandbox.TestNamespace()}
 	}
 	eng.Orch = orch.New(orch.Options{
 		Store:   st,
@@ -156,6 +101,9 @@ func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 			}
 			fake := model.NewFake(script)
 			fake.ModelName = eng.ModelName
+			if current.ModelName != "" {
+				fake.ModelName = current.ModelName
+			}
 			return fake, nil
 		},
 		NewWorkspace: func(current store.Run) (workspace.Handle, error) {
@@ -173,6 +121,14 @@ func NewEngine(t *testing.T, st *store.Store, hooks orch.Hooks) *Engine {
 				}
 				return workspace.HostExec(ctx, root, prof)
 			})
+			dir.CheckFn = func(ctx context.Context, root string, argv []string) (string, string, int, error) {
+				clone := prof
+				clone.Argv = append([]string(nil), argv...)
+				if eng.Runner != nil {
+					return eng.Runner.RunProfile(ctx, root, current.ID, clone)
+				}
+				return workspace.HostExec(ctx, root, clone)
+			}
 			if eng.Runner != nil {
 				dir.CloseFn = func(ctx context.Context) error {
 					return eng.Runner.Destroy(ctx, current.ID)

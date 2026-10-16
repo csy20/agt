@@ -37,14 +37,20 @@ func TestIdentityIsOpenAndOmitsSecrets(t *testing.T) {
 	if !strings.Contains(text, `"product":"agt"`) || !strings.Contains(text, version.Product) || !strings.Contains(text, "local-repair") {
 		t.Fatalf("identity %s", text)
 	}
+	if !strings.Contains(text, `"contract":"`+version.Contract+`"`) || !strings.Contains(text, `"sessions"`) || !strings.Contains(text, `"models"`) || !strings.Contains(text, `"build"`) {
+		t.Fatalf("identity contract %s", text)
+	}
 
 	health, err := http.Get(ts.URL + "/healthz")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer health.Body.Close()
-	if health.Header.Get(version.ProductHeader) != version.Name || health.Header.Get(version.VersionHeader) != version.Product {
+	if health.Header.Get(version.ProductHeader) != version.Name || health.Header.Get(version.VersionHeader) != version.Product || health.Header.Get(version.ContractHeader) != version.Contract {
 		t.Fatalf("headers %v", health.Header)
+	}
+	if !strings.Contains(health.Header.Get(version.CapabilitiesHeader), "sessions") || !strings.Contains(health.Header.Get(version.CapabilitiesHeader), "models") || health.Header.Get(version.BuildHeader) == "" {
+		t.Fatalf("capability headers %v", health.Header)
 	}
 	if health.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("nil store health %d", health.StatusCode)

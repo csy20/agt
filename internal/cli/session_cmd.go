@@ -10,6 +10,7 @@ import (
 
 	"github.com/csy20/agt/internal/client"
 	"github.com/csy20/agt/internal/id"
+	"github.com/csy20/agt/internal/verify"
 	"github.com/csy20/agt/internal/workspace"
 )
 
@@ -209,12 +210,18 @@ func sessionSubmit(args []string) int {
 	messageID := fs.String("message-id", "", "stable client message id")
 	providerFlag := fs.String("provider", "", "fake or openai")
 	scriptFlag := fs.String("script", "", "fake-provider script")
-	modelFlag := fs.String("model", "", "require this AGT_MODEL_NAME on agtd")
+	modelFlag := fs.String("model", "", "require this model name on agtd")
+	modelConfig := fs.String("model-config", "", "named model configuration")
 	interaction := fs.String("interaction", "agent", "agent, ask, or plan")
+	taskFlag := fs.String("task", "", "repair, feature, or refactor")
+	contractJSON := fs.String("contract-json", "", "verification contract JSON object")
+	contractFile := fs.String("contract-file", "", "verification contract file read by this client")
 	pf := addProfileFlags(fs)
 	flags := runValueFlags(false)
 	flags["message-id"] = true
 	flags["interaction"] = true
+	flags["model-config"] = true
+	flags["task"] = true
 	if err := fs.Parse(reorderFlags(args, flags)); err != nil {
 		return 2
 	}
@@ -232,10 +239,49 @@ func sessionSubmit(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	provider, _, script, err := runInputs(*providerFlag, repo, *scriptFlag)
+	task := verify.NormalizeTask(*taskFlag)
+	if strings.TrimSpace(*taskFlag) != "" && !verify.ValidTask(task) {
+		fmt.Fprintln(os.Stderr, "task must be repair, feature, or refactor")
+		return 2
+	}
+	mode := strings.TrimSpace(*interaction)
+	if mode == "" {
+		mode = "agent"
+	}
+	if (mode == "ask" || mode == "plan") && (task != verify.TaskRepair || strings.TrimSpace(*contractJSON) != "" || strings.TrimSpace(*contractFile) != "") {
+		fmt.Fprintln(os.Stderr, "ask and plan are read-only and do not take a verification contract")
+		return 2
+	}
+	contract, err := loadContract(task, *contractJSON, *contractFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
+	}
+	var provider, script string
+	if strings.TrimSpace(*modelConfig) == "" {
+		provider, _, script, err = runInputs(*providerFlag, repo, *scriptFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+	} else {
+		provider = strings.TrimSpace(*providerFlag)
+		if provider != "" && provider != "fake" && provider != "openai" {
+			fmt.Fprintf(os.Stderr, "provider must be fake or openai, got %q\n", provider)
+			return 2
+		}
+		if strings.TrimSpace(*scriptFlag) != "" {
+			if provider == "openai" {
+				fmt.Fprintln(os.Stderr, "--script is only used with the fake demo provider")
+				return 2
+			}
+			script, err = absolutePath(*scriptFlag)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 2
+			}
+			fmt.Fprintf(os.Stderr, "demo: scripted provider, not a live model (script %s)\n", script)
+		}
 	}
 	base, err := ensureServer(*server)
 	if err != nil {
@@ -252,12 +298,24 @@ func sessionSubmit(args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "client_message_id %s\n", msgID)
 	body := map[string]any{
-		"goal": *goal, "content": *goal, "repo_path": repo, "provider": provider,
+		"goal": *goal, "content": *goal, "repo_path": repo,
 		"interaction": *interaction, "profile": prof, "client_message_id": msgID,
 		"budget_cents": 100,
 	}
+	if provider != "" || strings.TrimSpace(*modelConfig) == "" {
+		body["provider"] = provider
+	}
+	if strings.TrimSpace(*modelConfig) != "" {
+		body["model_config"] = strings.TrimSpace(*modelConfig)
+	}
 	if script != "" {
 		body["script_path"] = script
+	}
+	if strings.TrimSpace(*taskFlag) != "" {
+		body["task_type"] = task
+	}
+	if len(contract) > 0 {
+		body["contract"] = json.RawMessage(contract)
 	}
 	var sub client.Submission
 	if err := postJSON(base+"/v1/sessions/"+fs.Arg(0)+"/messages", body, &sub); err != nil {

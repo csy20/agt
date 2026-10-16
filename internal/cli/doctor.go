@@ -197,15 +197,53 @@ func probeToken(dir string) doctorCheck {
 }
 
 func probeModel(cfg config.Config) doctorCheck {
-	msg := diag.ModelConfigWarning(cfg.Provider, cfg.ModelAPIKey, cfg.ModelName, cfg.ModelBaseURL)
-	detail := "provider " + cfg.Provider
-	if cfg.ModelName != "" {
-		detail += " model " + cfg.ModelName
+	cat := cfg.Models
+	if len(cat.Configs) == 0 {
+		cat = config.CatalogFrom(cfg)
 	}
-	if msg == "" {
-		return doctorCheck{Name: "model", OK: true, Detail: detail}
+	selected := config.ReadSelectedModel(cfg.DataDir)
+	if selected == "" {
+		selected = config.DefaultModelName
 	}
-	return doctorCheck{Name: "model", OK: false, Detail: msg, Next: msg}
+	getenv := func(key string) string {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+		if key == "AGT_MODEL_API_KEY" {
+			return cfg.ModelAPIKey
+		}
+		return ""
+	}
+	var problems []string
+	var active config.PublicModel
+	for _, item := range cat.Public(selected, getenv) {
+		if item.Name == selected {
+			active = item
+		}
+		if !item.Valid && item.Problem != "" {
+			problems = append(problems, item.Problem)
+		}
+	}
+	label := active.Name
+	if label == "" {
+		label = selected
+	}
+	if active.Scripted {
+		label = "scripted " + label
+	}
+	detail := "configuration " + label + " adapter " + active.Adapter
+	if active.Model != "" {
+		detail += " model " + active.Model
+	}
+	detail = cat.Hide(detail, getenv)
+	if len(problems) > 0 {
+		msg := cat.Hide(strings.Join(problems, "; "), getenv)
+		return doctorCheck{Name: "model", OK: false, Detail: msg, Next: "Fix the named model configuration. agt does not fall back to a hosted endpoint. Then run `agt doctor`"}
+	}
+	if msg := diag.ModelConfigWarning(cfg.Provider, cfg.ModelAPIKey, cfg.ModelName, cfg.ModelBaseURL); msg != "" {
+		return doctorCheck{Name: "model", OK: false, Detail: msg, Next: msg}
+	}
+	return doctorCheck{Name: "model", OK: true, Detail: detail}
 }
 
 func probeDocker(images []string) []doctorCheck {

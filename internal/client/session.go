@@ -13,9 +13,10 @@ import (
 
 // Session is one conversation bound to a repository.
 type Session struct {
-	ID       string `json:"id"`
-	RepoPath string `json:"repo_path"`
-	Title    string `json:"title"`
+	ID          string `json:"id"`
+	RepoPath    string `json:"repo_path"`
+	Title       string `json:"title"`
+	ModelConfig string `json:"model_config"`
 }
 
 // SessionMessage is one ordered conversation row.
@@ -144,8 +145,20 @@ func (c *Client) SubmitMessage(ctx context.Context, sessionID string, req Create
 		"profile":           req.Profile,
 		"client_message_id": clientMessageID,
 	}
+	if req.TaskType != "" {
+		body["task_type"] = req.TaskType
+	}
+	if len(bytes.TrimSpace(req.Contract)) > 0 {
+		body["contract"] = req.Contract
+	}
 	if req.ScriptPath != "" {
 		body["script_path"] = req.ScriptPath
+	}
+	if req.ModelConfig != "" {
+		body["model_config"] = req.ModelConfig
+	}
+	if req.Provider == "" && req.ModelConfig != "" {
+		delete(body, "provider")
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

@@ -14,7 +14,7 @@ import (
 // Network is always none. Docker's default tmpfs is noexec, so /tmp must set
 // exec: Go writes and runs the test binary there. The root filesystem stays
 // read-only and nosuid stays set.
-func containerRunArgs(spec ExecSpec, name, worktree, runID, user, extraLabel string) ([]string, error) {
+func containerRunArgs(spec ExecSpec, name, worktree, runID, user, extraLabel, namespace string) ([]string, error) {
 	if err := validateMountSource(worktree); err != nil {
 		return nil, err
 	}
@@ -25,6 +25,7 @@ func containerRunArgs(spec ExecSpec, name, worktree, runID, user, extraLabel str
 		"run", "-d",
 		"--name", name,
 		"--label", "agt-run=" + runID,
+		"--label", "agt-namespace=" + namespaceLabel(namespace),
 		"--network", "none",
 		"--read-only",
 		"--tmpfs", "/tmp:rw,exec,nosuid,size=128m",
@@ -47,6 +48,13 @@ func containerRunArgs(spec ExecSpec, name, worktree, runID, user, extraLabel str
 	}
 	args = append(args, spec.Image, "sleep", "infinity")
 	return args, nil
+}
+
+func namespaceLabel(namespace string) string {
+	if strings.TrimSpace(namespace) == "" {
+		namespace = "default"
+	}
+	return sanitizeName(namespace)
 }
 
 func containerExecArgs(name, user, workdir string, env, argv []string) []string {

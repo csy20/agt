@@ -73,7 +73,7 @@ type Usage struct {
 
 func (s *Store) CommitModelIntent(ctx context.Context, runID string, fromVersion int64, in Intent) (Run, error) {
 	var out Run
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		cur, err := lockRun(ctx, tx, runID)
 		if err != nil {
 			return err
@@ -277,7 +277,7 @@ func (s *Store) FinishCommand(ctx context.Context, commandID, state string, resu
 		Output   string `json:"output"`
 	}
 	_ = json.Unmarshal(body, &parsed)
-	return s.withTx(ctx, func(tx pgx.Tx) error {
+	return s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var runID, tool string
 		err := tx.QueryRow(ctx, `SELECT run_id, tool FROM commands WHERE command_id=$1`, commandID).Scan(&runID, &tool)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -364,7 +364,7 @@ func (s *Store) RecordSystemCommand(ctx context.Context, runID, commandID, tool,
 	if err != nil {
 		return err
 	}
-	return s.withTx(ctx, func(tx pgx.Tx) error {
+	return s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		cur, err := lockRun(ctx, tx, runID)
 		if err != nil {
 			return err
@@ -393,7 +393,7 @@ func (s *Store) Approve(ctx context.Context, in Approval) (Run, error) {
 		return Run{}, fmt.Errorf("decision must be approved or rejected")
 	}
 	var out Run
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		cur, err := lockRun(ctx, tx, in.RunID)
 		if err != nil {
 			return err
@@ -465,7 +465,7 @@ func (s *Store) Approve(ctx context.Context, in Approval) (Run, error) {
 }
 
 func (s *Store) Enqueue(ctx context.Context, runID string) error {
-	return s.withTx(ctx, func(tx pgx.Tx) error {
+	return s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		return enqueueJob(ctx, tx, runID)
 	})
 }
@@ -477,7 +477,7 @@ func (s *Store) Resume(ctx context.Context, runID string, fromVersion int64, fro
 		return Run{}, fmt.Errorf("resume requires PAUSED or PAUSED_BUDGET")
 	}
 	var out Run
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		cur, err := lockRun(ctx, tx, runID)
 		if err != nil {
 			return err
@@ -616,7 +616,7 @@ func (s *Store) ReleaseJob(ctx context.Context, jobID int64, owner string, fence
 // the same worker continues. Lock the run before the job.
 func (s *Store) FinishIfQuiescent(ctx context.Context, jobID int64, owner string, fence int64) (bool, error) {
 	var finished bool
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var runID string
 		err := tx.QueryRow(ctx, `SELECT run_id FROM run_jobs WHERE id=$1`, jobID).Scan(&runID)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -690,7 +690,7 @@ func (s *Store) ActiveJob(ctx context.Context, runID string) (Job, error) {
 }
 
 func (s *Store) AddUsage(ctx context.Context, runID, kind string, quantity, cost int64, modelName, profileName string) error {
-	return s.withTx(ctx, func(tx pgx.Tx) error {
+	return s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := lockRun(ctx, tx, runID); err != nil {
 			return err
 		}

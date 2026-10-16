@@ -21,7 +21,7 @@ func completion(args []string) int {
 }
 
 func rootCommands() []string {
-	return []string{"fix", "profile", "approve", "run", "doctor", "setup", "tui", "session", "completion", "version", "help"}
+	return []string{"fix", "feature", "refactor", "profile", "approve", "run", "doctor", "setup", "tui", "session", "model", "agent", "completion", "version", "help"}
 }
 
 func runCommands() []string {
@@ -32,6 +32,8 @@ func completionScript(shell string) (string, bool) {
 	roots := strings.Join(rootCommands(), " ")
 	runs := strings.Join(runCommands(), " ")
 	sessions := strings.Join(sessionCommands(), " ")
+	models := strings.Join(modelCommands(), " ")
+	agents := strings.Join(agentCommands(), " ")
 	switch shell {
 	case "bash":
 		return fmt.Sprintf(`_agt() {
@@ -49,16 +51,24 @@ func completionScript(shell string) (string, bool) {
   if [[ ${prev} == session ]]; then
     COMPREPLY=( $(compgen -W "%s" -- "$cur") )
   fi
+  if [[ ${prev} == model ]]; then
+    COMPREPLY=( $(compgen -W "%s" -- "$cur") )
+  fi
+  if [[ ${prev} == agent ]]; then
+    COMPREPLY=( $(compgen -W "%s" -- "$cur") )
+  fi
 }
 complete -F _agt agt
-`, roots, runs, sessions), true
+`, roots, runs, sessions, models, agents), true
 	case "zsh":
 		return fmt.Sprintf(`#compdef agt
 _agt() {
-  local -a commands runs sessions
+  local -a commands runs sessions models agents
   commands=(%s)
   runs=(%s)
   sessions=(%s)
+  models=(%s)
+  agents=(%s)
   if (( CURRENT == 2 )); then
     _describe command commands
     return
@@ -69,16 +79,24 @@ _agt() {
   if [[ ${words[2]} == session ]]; then
     _describe session sessions
   fi
+  if [[ ${words[2]} == model ]]; then
+    _describe model models
+  fi
+  if [[ ${words[2]} == agent ]]; then
+    _describe agent agents
+  fi
 }
 compdef _agt agt
-`, roots, runs, sessions), true
+`, roots, runs, sessions, models, agents), true
 	case "fish":
 		return fmt.Sprintf(`complete -c agt -n "not __fish_seen_subcommand_from %s" -a "%s"
 complete -c agt -n "__fish_seen_subcommand_from run" -a "%s"
 complete -c agt -n "__fish_seen_subcommand_from session" -a "%s"
-`, roots, roots, runs, sessions), true
+complete -c agt -n "__fish_seen_subcommand_from model" -a "%s"
+complete -c agt -n "__fish_seen_subcommand_from agent" -a "%s"
+`, roots, roots, runs, sessions, models, agents), true
 	case "powershell":
-		var rootsQ, runsQ, sessionsQ []string
+		var rootsQ, runsQ, sessionsQ, modelsQ, agentsQ []string
 		for _, name := range rootCommands() {
 			rootsQ = append(rootsQ, "'"+name+"'")
 		}
@@ -88,20 +106,30 @@ complete -c agt -n "__fish_seen_subcommand_from session" -a "%s"
 		for _, name := range sessionCommands() {
 			sessionsQ = append(sessionsQ, "'"+name+"'")
 		}
+		for _, name := range modelCommands() {
+			modelsQ = append(modelsQ, "'"+name+"'")
+		}
+		for _, name := range agentCommands() {
+			agentsQ = append(agentsQ, "'"+name+"'")
+		}
 		return fmt.Sprintf(`Register-ArgumentCompleter -Native -CommandName agt -ScriptBlock {
   param($wordToComplete, $commandAst, $cursorPosition)
   $roots = @(%s)
   $runs = @(%s)
   $sessions = @(%s)
+  $models = @(%s)
+  $agents = @(%s)
   $words = @($commandAst.CommandElements | ForEach-Object { $_.ToString() })
   $choices = $roots
   if ($words.Count -ge 2 -and $words[1] -eq 'run') { $choices = $runs }
   if ($words.Count -ge 2 -and $words[1] -eq 'session') { $choices = $sessions }
+  if ($words.Count -ge 2 -and $words[1] -eq 'model') { $choices = $models }
+  if ($words.Count -ge 2 -and $words[1] -eq 'agent') { $choices = $agents }
   $choices | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
     [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
   }
 }
-`, strings.Join(rootsQ, ","), strings.Join(runsQ, ","), strings.Join(sessionsQ, ",")), true
+`, strings.Join(rootsQ, ","), strings.Join(runsQ, ","), strings.Join(sessionsQ, ","), strings.Join(modelsQ, ","), strings.Join(agentsQ, ",")), true
 	default:
 		return "", false
 	}

@@ -57,7 +57,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $env:AGT_INTEGRATION = "1"
-$env:AGT_DATABASE_URL = "postgres://agt:agt@127.0.0.1:54329/agt?sslmode=disable"
+# Maintenance database only. Tests create agt_test_* databases and refuse to
+# reset or drop the shared development database agt.
+$env:AGT_DATABASE_URL = "postgres://agt:agt@127.0.0.1:54329/postgres?sslmode=disable"
 $env:AGT_IMAGE_PYTHON = "agt-sandbox:python"
 $env:AGT_IMAGE_GO = "agt-sandbox:go"
 $env:AGT_IMAGE_NODE = "agt-sandbox:node"

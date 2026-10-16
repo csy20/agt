@@ -48,11 +48,16 @@ func New(base, token string) *Client {
 
 // Identity is the unauthenticated daemon record. It has no API key and no bearer token.
 type Identity struct {
-	Product  string `json:"product"`
-	Version  string `json:"version"`
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
-	Listen   string `json:"listen"`
+	Product      string   `json:"product"`
+	Version      string   `json:"version"`
+	Contract     string   `json:"contract"`
+	Build        string   `json:"build"`
+	Capabilities []string `json:"capabilities"`
+	Provider     string   `json:"provider"`
+	Model        string   `json:"model"`
+	ModelConfig  string   `json:"model_config"`
+	Scripted     bool     `json:"scripted"`
+	Listen       string   `json:"listen"`
 }
 
 func (c *Client) Identity(ctx context.Context) (Identity, error) {
@@ -62,6 +67,9 @@ func (c *Client) Identity(ctx context.Context) (Identity, error) {
 	}
 	if id.Product != version.Name || id.Version != version.Product {
 		return Identity{}, fmt.Errorf("identity %s %s does not match this agt %s %s", id.Product, id.Version, version.Name, version.Product)
+	}
+	if missing := version.MissingAdvertised(id.Contract, id.Capabilities); len(missing) > 0 {
+		return Identity{}, version.IncompatibleDaemon(c.Base, id.Version, missing)
 	}
 	return id, nil
 }
@@ -75,7 +83,12 @@ type CreateRequest struct {
 	ScriptPath  string
 	BudgetCents int
 	Interaction string
+	// TaskType is repair, feature, or refactor. Empty stays repair.
+	TaskType string
+	// Contract is the verification object. The daemon does not receive a path.
+	Contract    json.RawMessage
 	Profile     profile.Request
+	ModelConfig string
 }
 
 // Created is the create response.
@@ -94,8 +107,20 @@ func (c *Client) CreateRun(ctx context.Context, req CreateRequest) (Created, err
 		"interaction":  req.Interaction,
 		"profile":      req.Profile,
 	}
+	if req.TaskType != "" {
+		body["task_type"] = req.TaskType
+	}
+	if len(bytes.TrimSpace(req.Contract)) > 0 {
+		body["contract"] = req.Contract
+	}
 	if req.ScriptPath != "" {
 		body["script_path"] = req.ScriptPath
+	}
+	if req.ModelConfig != "" {
+		body["model_config"] = req.ModelConfig
+	}
+	if req.Provider == "" && req.ModelConfig != "" {
+		delete(body, "provider")
 	}
 	var created Created
 	if err := c.post(ctx, "/v1/runs", body, &created); err != nil {
@@ -109,18 +134,25 @@ func (c *Client) CreateRun(ctx context.Context, req CreateRequest) (Created, err
 
 // Run is the durable run view.
 type Run struct {
-	ID          string          `json:"id"`
-	State       string          `json:"state"`
-	RepoPath    string          `json:"repo_path"`
-	Worktree    string          `json:"worktree"`
-	SpentMicros int64           `json:"spent_micros"`
-	BudgetCents int             `json:"budget_cents"`
-	Error       string          `json:"error"`
-	Interaction string          `json:"interaction"`
-	Provider    string          `json:"provider"`
-	Result      json.RawMessage `json:"result"`
-	Profile     json.RawMessage `json:"profile"`
-	UsageMicros int64           `json:"usage_micros"`
+	ID                  string          `json:"id"`
+	State               string          `json:"state"`
+	RepoPath            string          `json:"repo_path"`
+	Worktree            string          `json:"worktree"`
+	SpentMicros         int64           `json:"spent_micros"`
+	BudgetCents         int             `json:"budget_cents"`
+	Error               string          `json:"error"`
+	Interaction         string          `json:"interaction"`
+	TaskType            string          `json:"task_type"`
+	ContractDigest      string          `json:"contract_digest"`
+	VerificationOutcome string          `json:"verification_outcome"`
+	VerificationDigest  string          `json:"verification_digest"`
+	Provider            string          `json:"provider"`
+	Result              json.RawMessage `json:"result"`
+	Contract            json.RawMessage `json:"contract"`
+	Baseline            json.RawMessage `json:"baseline"`
+	Final               json.RawMessage `json:"final"`
+	Profile             json.RawMessage `json:"profile"`
+	UsageMicros         int64           `json:"usage_micros"`
 }
 
 func (c *Client) Run(ctx context.Context, runID string) (Run, error) {

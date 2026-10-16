@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,9 @@ import (
 func writeTestHealth(w http.ResponseWriter) {
 	w.Header().Set(version.ProductHeader, version.Name)
 	w.Header().Set(version.VersionHeader, version.Product)
+	w.Header().Set(version.ContractHeader, version.Contract)
+	w.Header().Set(version.BuildHeader, "local+test")
+	w.Header().Set(version.CapabilitiesHeader, version.CapabilityHeaderValue())
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "ok\n")
 }
@@ -83,6 +87,44 @@ func TestDiscoverAcceptsThisVersionOnly(t *testing.T) {
 	err := discover(ts.URL)
 	if err == nil || !strings.Contains(err.Error(), "9.9.9") || !strings.Contains(err.Error(), "Next:") {
 		t.Fatalf("error %v", err)
+	}
+}
+
+func TestDiscoverRejectsMatchingProductWithoutContract(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(version.ProductHeader, version.Name)
+		w.Header().Set(version.VersionHeader, version.Product)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(ts.Close)
+	err := discover(ts.URL)
+	if err == nil || errors.Is(err, errDaemonDown) {
+		t.Fatalf("error %v", err)
+	}
+	for _, part := range []string{ts.URL, version.Product, "does not advertise", version.Contract, "sessions", "models", "Next: rebuild agtd from this checkout", "This command does not stop another process."} {
+		if !strings.Contains(err.Error(), part) {
+			t.Fatalf("missing %q in %v", part, err)
+		}
+	}
+	_, err = ensureServer(ts.URL)
+	if err == nil || errors.Is(err, errDaemonDown) || !strings.Contains(err.Error(), "does not stop another process") {
+		t.Fatalf("ensureServer %v", err)
+	}
+}
+
+func TestIdentityRejectsMatchingVersionWithoutCapabilities(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"product":%q,"version":%q,"contract":%q,"capabilities":["sessions"]}`, version.Name, version.Product, version.Contract)
+	}))
+	t.Cleanup(ts.Close)
+	_, err := fetchIdentity(ts.URL)
+	if err == nil || errors.Is(err, errDaemonDown) {
+		t.Fatalf("error %v", err)
+	}
+	for _, part := range []string{ts.URL, version.Product, "does not advertise", "models", "Next: rebuild agtd from this checkout", "This command does not stop another process."} {
+		if !strings.Contains(err.Error(), part) {
+			t.Fatalf("missing %q in %v", part, err)
+		}
 	}
 }
 
@@ -192,7 +234,7 @@ func TestModelFlagRejectsADifferentDaemonModel(t *testing.T) {
 		case r.URL.Path == "/healthz":
 			writeTestHealth(w)
 		case r.URL.Path == "/v1/identity":
-			fmt.Fprintf(w, `{"product":%q,"version":%q,"provider":"openai","model":"other"}`, version.Name, version.Product)
+			fmt.Fprintf(w, `{"product":%q,"version":%q,"contract":%q,"provider":"openai","model":"other","capabilities":["sessions","models"]}`, version.Name, version.Product, version.Contract)
 		case r.URL.Path == "/v1/runs":
 			posts++
 			w.WriteHeader(http.StatusInternalServerError)

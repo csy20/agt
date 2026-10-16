@@ -3,9 +3,14 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,10 +23,44 @@ import (
 type Runner struct {
 	Images     profile.Images
 	ExtraLabel string
+	// Namespace keeps this daemon's containers out of another daemon's sweep.
+	// Empty means "default".
+	Namespace string
 
 	mu    sync.Mutex
 	execs int
 	ready bool
+}
+
+func (r *Runner) namespace() string {
+	ns := strings.TrimSpace(r.Namespace)
+	if ns == "" {
+		ns = "default"
+	}
+	return sanitizeName(ns)
+}
+
+// NamespaceFor derives a stable container namespace from one data directory.
+func NamespaceFor(dataDir string) string {
+	sum := sha256.Sum256([]byte("agt-data\n" + dataDir))
+	return "ns" + hex.EncodeToString(sum[:3])
+}
+
+// TestNamespace is unique to this test process.
+func TestNamespace() string {
+	return "t" + strconv.Itoa(os.Getpid())
+}
+
+// Owns reports whether labels belong to namespace and runID.
+func Owns(namespace string, labels map[string]string, runID string) bool {
+	if strings.TrimSpace(namespace) == "" {
+		namespace = "default"
+	}
+	namespace = sanitizeName(namespace)
+	if labels == nil {
+		return false
+	}
+	return labels["agt-namespace"] == namespace && labels["agt-run"] == runID
 }
 
 func (r *Runner) ExecCount() int {
@@ -75,7 +114,7 @@ func (r *Runner) Exec(ctx context.Context, worktree, runID string, spec ExecSpec
 	if err != nil {
 		return "", "", 0, err
 	}
-	cmd := dockerCommand(ctx, containerExecArgs(containerName(runID), user, spec.Workdir, spec.Env, spec.Argv)...)
+	cmd := dockerCommand(ctx, containerExecArgs(containerName(r.namespace(), runID), user, spec.Workdir, spec.Env, spec.Argv)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -90,11 +129,23 @@ func (r *Runner) Exec(ctx context.Context, worktree, runID string, spec ExecSpec
 	return stdout.String(), stderr.String(), 0, err
 }
 
-// Destroy removes the run container if it exists.
+// Destroy removes the run container when it belongs to this namespace.
+// A missing container is success. An inspect failure does not remove anything.
 func (r *Runner) Destroy(ctx context.Context, runID string) error {
-	cmd := dockerCommand(ctx, "rm", "-f", containerName(runID))
+	name := containerName(r.namespace(), runID)
+	labels, missing, err := inspectLabels(ctx, name)
+	if missing {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !Owns(r.namespace(), labels, runID) {
+		return fmt.Errorf("refusing to remove container %s: namespace or run does not match", name)
+	}
+	cmd := dockerCommand(ctx, "rm", "-f", name)
 	out, err := cmd.CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "No such container") {
+	if err != nil && !missingContainer(string(out)) {
 		return fmt.Errorf("docker rm: %w: %s", err, bytes.TrimSpace(out))
 	}
 	return nil
@@ -104,7 +155,7 @@ func (r *Runner) ensure(ctx context.Context, worktree, runID string, spec ExecSp
 	if err := validateMountSource(worktree); err != nil {
 		return err
 	}
-	name := containerName(runID)
+	name := containerName(r.namespace(), runID)
 	status, err := inspectStatus(ctx, name)
 	if err != nil {
 		return r.start(ctx, name, worktree, runID, spec)
@@ -131,7 +182,7 @@ func (r *Runner) start(ctx context.Context, name, worktree, runID string, spec E
 	if err != nil {
 		return err
 	}
-	args, err := containerRunArgs(spec, name, worktree, runID, user, r.ExtraLabel)
+	args, err := containerRunArgs(spec, name, worktree, runID, user, r.ExtraLabel, r.namespace())
 	if err != nil {
 		return err
 	}
@@ -161,16 +212,46 @@ func inspectImage(ctx context.Context, name string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func containerName(runID string) string {
+func inspectLabels(ctx context.Context, name string) (map[string]string, bool, error) {
+	cmd := dockerCommand(ctx, "inspect", "--format", "{{json .Config.Labels}}", name)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if missingContainer(string(out)) {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("docker inspect: %w: %s", err, bytes.TrimSpace(out))
+	}
+	var labels map[string]string
+	if err := json.Unmarshal(bytes.TrimSpace(out), &labels); err != nil {
+		return nil, false, fmt.Errorf("docker inspect labels: %w", err)
+	}
+	return labels, false, nil
+}
+
+func missingContainer(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "no such object") || strings.Contains(lower, "no such container")
+}
+
+func containerName(namespace, runID string) string {
+	if strings.TrimSpace(namespace) == "" {
+		namespace = "default"
+	}
+	return "agt-" + sanitizeName(namespace) + "-" + sanitizeName(runID)
+}
+
+func sanitizeName(part string) string {
 	var b strings.Builder
-	b.WriteString("agt-")
-	for _, r := range runID {
+	for _, r := range part {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
 			b.WriteRune(r)
 		default:
 			b.WriteByte('-')
 		}
+	}
+	if b.Len() == 0 {
+		return "x"
 	}
 	return b.String()
 }

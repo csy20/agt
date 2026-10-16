@@ -4,6 +4,7 @@
 # support. make test sets AGT_INTEGRATION=1 and fails instead of skipping.
 ./cmd/agt
 ./cmd/agtd
+./internal/agent
 ./internal/auth
 ./internal/cli
 ./internal/client
@@ -22,5 +23,6 @@
 ./internal/tui
 ./internal/tools
 ./internal/usage
+./internal/verify
 ./internal/version
 ./internal/workspace

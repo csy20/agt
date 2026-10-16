@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +34,7 @@ func TestServerRestartKeepsTheEventLog(t *testing.T) {
 	t.Cleanup(func() {
 		stopProcess(current)
 	})
-	current = startAgtd(t, agtdBin, data, addr)
+	current = startAgtd(t, agtdBin, data, addr, testutil.URL(st))
 	base := "http://" + addr
 
 	body := map[string]any{
@@ -53,7 +54,7 @@ func TestServerRestartKeepsTheEventLog(t *testing.T) {
 
 	stopProcess(current)
 	current = nil
-	current = startAgtd(t, agtdBin, data, addr)
+	current = startAgtd(t, agtdBin, data, addr, testutil.URL(st))
 
 	after := getBytes(t, base+"/v1/runs/"+created.runID+"/events")
 	if !eventsEqual(t, before, after) {
@@ -106,6 +107,101 @@ func TestServerRestartKeepsTheEventLog(t *testing.T) {
 	_ = st
 }
 
+func TestModelSelectionSurvivesDaemonRestart(t *testing.T) {
+	const secret = "sk-test-secret-value"
+	root := testutil.RepoRoot(t)
+	script := filepath.Join(root, "eval", "scripts", "fix_retry.json")
+	t.Setenv("AGT_TOKEN", testToken)
+	t.Setenv("AGT_PROVIDER", "fake")
+	t.Setenv("AGT_MODEL_NAME", "scripted-model")
+	t.Setenv("AGT_MODEL_API_KEY", secret)
+	t.Setenv("AGT_MODELS", "local,cloud")
+	t.Setenv("AGT_MODEL_LOCAL_ADAPTER", "fake")
+	t.Setenv("AGT_MODEL_LOCAL_MODEL", "local-repair")
+	t.Setenv("AGT_MODEL_LOCAL_SCRIPT", script)
+	t.Setenv("AGT_MODEL_CLOUD_ADAPTER", "openai")
+	t.Setenv("AGT_MODEL_CLOUD_MODEL", "cloud-model")
+	t.Setenv("AGT_MODEL_CLOUD_ENDPOINT", "http://127.0.0.1:9/v1")
+
+	binDir := t.TempDir()
+	agtdBin := buildBin(t, root, binDir, "agtd", "./cmd/agtd")
+	st := testutil.Open(t)
+	addr := freeAddr(t)
+	data := t.TempDir()
+	var current *exec.Cmd
+	t.Cleanup(func() { stopProcess(current) })
+	current = startAgtd(t, agtdBin, data, addr, testutil.URL(st))
+	base := "http://" + addr
+
+	selected := postJSON(t, base+"/v1/models/select", map[string]any{"name": "local"}, "select-restart")
+	selectedBody, _ := io.ReadAll(selected.body)
+	selected.body.Close()
+	if selected.status != http.StatusOK || strings.Contains(string(selectedBody), secret) {
+		t.Fatalf("select %d leaked=%v", selected.status, strings.Contains(string(selectedBody), secret))
+	}
+	created := postRun(t, base, map[string]any{
+		"goal":         "restart keeps " + secret,
+		"repo_path":    testutil.Fixture(t),
+		"model_config": "local",
+		"max_steps":    0,
+		"profile":      pythonProfile(),
+	}, "idem-model-restart")
+	if created.status != http.StatusAccepted && created.status != http.StatusOK {
+		t.Fatalf("create %d %s", created.status, created.body)
+	}
+	waitHTTPState(t, base, created.runID, "PAUSED_BUDGET")
+	before := getJSON(t, base+"/v1/runs/"+created.runID)
+	if before["model_config"] != "local" || before["model_name"] != "local-repair" || before["scripted"] != true {
+		t.Fatalf("before %#v", before)
+	}
+	events := getBytes(t, base+"/v1/runs/"+created.runID+"/events")
+	if strings.Contains(string(events), secret) {
+		t.Fatal("credential leaked in events")
+	}
+
+	stopProcess(current)
+	current = nil
+	current = startAgtd(t, agtdBin, data, addr, testutil.URL(st))
+	listed := getJSON(t, base+"/v1/models")
+	if listed["selected"] != "local" {
+		t.Fatalf("selection after restart %#v", listed["selected"])
+	}
+	after := getJSON(t, base+"/v1/runs/"+created.runID)
+	if after["model_config"] != "local" || after["model_name"] != "local-repair" || after["model_endpoint"] != before["model_endpoint"] {
+		t.Fatalf("run changed %#v", after)
+	}
+	cloud := postJSON(t, base+"/v1/models/select", map[string]any{"name": "cloud"}, "select-cloud")
+	cloudBody, _ := io.ReadAll(cloud.body)
+	cloud.body.Close()
+	if cloud.status != http.StatusOK || strings.Contains(string(cloudBody), secret) {
+		t.Fatalf("cloud select %d", cloud.status)
+	}
+	second := postRun(t, base, map[string]any{
+		"goal": "second", "repo_path": testutil.Fixture(t), "model_config": "cloud",
+		"max_steps": 0, "profile": pythonProfile(),
+	}, "idem-model-cloud")
+	if second.status != http.StatusAccepted && second.status != http.StatusOK {
+		t.Fatalf("second %d %s", second.status, second.body)
+	}
+	waitHTTPState(t, base, second.runID, "PAUSED_BUDGET")
+	secondView := getJSON(t, base+"/v1/runs/"+second.runID)
+	if secondView["model_config"] != "cloud" || secondView["model_name"] != "cloud-model" || secondView["model_endpoint"] != "http://127.0.0.1:9/v1" {
+		t.Fatalf("second snapshot %#v", secondView)
+	}
+	still := getJSON(t, base+"/v1/runs/"+created.runID)
+	if still["model_config"] != "local" || still["model_name"] != "local-repair" {
+		t.Fatalf("first run moved %#v", still)
+	}
+	logBody, err := os.ReadFile(filepath.Join(data, "agtd.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logBody), secret) {
+		t.Fatal("credential leaked in the daemon log")
+	}
+	_ = st
+}
+
 func buildBin(t *testing.T, root, dir, name, pkg string) string {
 	t.Helper()
 	out := filepath.Join(dir, name)
@@ -120,17 +216,33 @@ func buildBin(t *testing.T, root, dir, name, pkg string) string {
 
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for attempt := 0; attempt < 8; attempt++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		ln.Close()
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if port == "8787" {
+			continue
+		}
+		return addr
 	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return addr
+	t.Fatal("no loopback port other than 8787")
+	return ""
 }
 
-func startAgtd(t *testing.T, bin, data, addr string) *exec.Cmd {
+func startAgtd(t *testing.T, bin, data, addr, databaseURL string) *exec.Cmd {
 	t.Helper()
+	refuseSharedDatabase(t, databaseURL)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "8787" {
+		t.Fatalf("refusing listen address %s", addr)
+	}
 	logPath := filepath.Join(data, "agtd.log")
 	var last []byte
 	for attempt := 0; attempt < 3; attempt++ {
@@ -141,10 +253,10 @@ func startAgtd(t *testing.T, bin, data, addr string) *exec.Cmd {
 		cmd := exec.Command(bin)
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
-		cmd.Env = append(os.Environ(),
+		cmd.Env = append(filterEnv(os.Environ(), "AGT_DATABASE_URL", "AGT_DATA_DIR", "AGT_LISTEN"),
 			"AGT_LISTEN="+addr,
 			"AGT_DATA_DIR="+data,
-			"AGT_DATABASE_URL="+testutil.DatabaseURL(),
+			"AGT_DATABASE_URL="+databaseURL,
 			"AGT_PROVIDER=fake",
 		)
 		if err := cmd.Start(); err != nil {
@@ -163,6 +275,34 @@ func startAgtd(t *testing.T, bin, data, addr string) *exec.Cmd {
 	}
 	t.Fatalf("agtd did not become healthy\n%s", last)
 	return nil
+}
+
+func refuseSharedDatabase(t *testing.T, raw string) {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := strings.Trim(parsed.Path, "/")
+	if !strings.HasPrefix(name, "agt_test_") {
+		t.Fatalf("agtd database %q is not a disposable test database", name)
+	}
+}
+
+func filterEnv(env []string, keys ...string) []string {
+	drop := map[string]bool{}
+	for _, key := range keys {
+		drop[key] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, item := range env {
+		name, _, _ := strings.Cut(item, "=")
+		if drop[name] {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func waitHealth(addr string, d time.Duration) bool {

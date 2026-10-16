@@ -37,6 +37,13 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Copy the daemon selection now. A later change to the default file does not move this session.
+	name := s.selectedName()
+	if err := s.Store.SetSessionModel(r.Context(), sess.ID, name); err != nil {
+		writeError(w, http.StatusInternalServerError, s.hide(err.Error()))
+		return
+	}
+	sess.ModelConfig = name
 	writeJSON(w, http.StatusCreated, map[string]any{"session": sessionJSON(sess)})
 }
 
@@ -138,7 +145,16 @@ func (s *Server) submitSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "client_message_id is required")
 		return
 	}
-	in, code, msg := s.prepareRun(body)
+	sess, err := s.Store.GetSession(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, s.hide(err.Error()))
+		return
+	}
+	in, code, msg := s.prepareRun(body, sess.ModelConfig)
 	if code != 0 {
 		writeError(w, code, msg)
 		return
@@ -146,15 +162,6 @@ func (s *Server) submitSession(w http.ResponseWriter, r *http.Request) {
 	repo, err := workspace.CanonicalRepo(in.RepoPath)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	sess, err := s.Store.GetSession(r.Context(), r.PathValue("id"))
-	if errors.Is(err, store.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "session not found")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if repo != sess.RepoPath {
@@ -165,7 +172,7 @@ func (s *Server) submitSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.RepoPath = sess.RepoPath
-	in.RequestHash = requestHash(in.Goal, in.RepoPath, in.BudgetCents, in.MaxSteps, in.WallSeconds, in.Provider, in.ScriptJSON, in.ProfileJSON, in.Interaction)
+	in.RequestHash = requestHash(in.Goal, in.RepoPath, in.BudgetCents, in.MaxSteps, in.WallSeconds, in.Provider, in.ModelConfig, in.ModelName, in.ScriptJSON, in.ProfileJSON, in.Interaction, in.TaskType, in.ContractJSON)
 	pending, err := s.pendingWithDigests(r, sess.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -280,7 +287,8 @@ func (s *Server) pendingWithDigests(r *http.Request, sessionID string) ([]store.
 func sessionJSON(sess store.Session) map[string]any {
 	return map[string]any{
 		"id": sess.ID, "repo_path": sess.RepoPath, "title": sess.Title,
-		"created_at": sess.CreatedAt, "updated_at": sess.UpdatedAt,
+		"model_config": sess.ModelConfig,
+		"created_at":   sess.CreatedAt, "updated_at": sess.UpdatedAt,
 	}
 }
 

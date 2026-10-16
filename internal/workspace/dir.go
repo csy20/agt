@@ -10,12 +10,17 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/csy20/agt/internal/patch"
 	"github.com/csy20/agt/internal/tools"
 )
 
 // TestFunc runs the fixed repository test command. Production points it at a
 // sandbox; tests may point it at a local interpreter.
 type TestFunc func(ctx context.Context, root string) (stdout, stderr string, code int, err error)
+
+// CheckFunc runs one contract argv with the same runner as TestFunc.
+// The argv is already validated. This is not a shell.
+type CheckFunc func(ctx context.Context, root string, argv []string) (stdout, stderr string, code int, err error)
 
 // Handle is the workspace the orchestrator is allowed to touch.
 type Handle interface {
@@ -26,6 +31,8 @@ type Handle interface {
 	Write(ctx context.Context, args tools.WriteArgs) (string, int, error)
 	Delete(ctx context.Context, args tools.DeleteArgs) (string, int, error)
 	Test(ctx context.Context) (string, int, error)
+	Check(ctx context.Context, argv []string) (string, int, error)
+	Artifact(meta patch.Meta) (patch.Artifact, error)
 	Calls() []string
 	Close(ctx context.Context) error
 }
@@ -36,6 +43,7 @@ type Dir struct {
 	Work    string
 	Base    string
 	TestFn  TestFunc
+	CheckFn CheckFunc
 	CloseFn func(context.Context) error
 
 	mu    sync.Mutex
@@ -129,11 +137,34 @@ func (d *Dir) Test(ctx context.Context) (string, int, error) {
 	if err != nil {
 		return "", code, err
 	}
+	return joinOutput(stdout, stderr), code, nil
+}
+
+func (d *Dir) Check(ctx context.Context, argv []string) (string, int, error) {
+	d.note("check")
+	if d.CheckFn == nil {
+		return "", 0, fmt.Errorf("no check runner configured")
+	}
+	if len(argv) == 0 {
+		return "", 0, fmt.Errorf("check argv is empty")
+	}
+	stdout, stderr, code, err := d.CheckFn(ctx, d.Work, argv)
+	if err != nil {
+		return "", code, err
+	}
+	return joinOutput(stdout, stderr), code, nil
+}
+
+func (d *Dir) Artifact(meta patch.Meta) (patch.Artifact, error) {
+	return patch.Build(d.Base, d.Work, meta)
+}
+
+func joinOutput(stdout, stderr string) string {
 	out := strings.TrimSpace(stdout + "\n" + stderr)
 	if out == "" {
 		out = "(no output)"
 	}
-	return out, code, nil
+	return out
 }
 
 func (d *Dir) Close(ctx context.Context) error {

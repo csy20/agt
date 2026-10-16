@@ -24,6 +24,7 @@ type Config struct {
 	InputPerMillion  int64
 	OutputPerMillion int64
 	OTLPEndpoint     string
+	Models           Catalog
 }
 
 func Load() Config {
@@ -38,7 +39,7 @@ func Load() Config {
 	if sandbox == "" {
 		sandbox = python
 	}
-	return Config{
+	cfg := Config{
 		ListenAddr:       env("AGT_LISTEN", "127.0.0.1:8787"),
 		DatabaseURL:      env("AGT_DATABASE_URL", "postgres://agt:agt@127.0.0.1:54329/agt?sslmode=disable"),
 		SandboxImage:     sandbox,
@@ -54,6 +55,8 @@ func Load() Config {
 		OutputPerMillion: dollarsPerMillion("AGT_OUTPUT_USD_PER_M", 0.50),
 		OTLPEndpoint:     os.Getenv("AGT_OTLP_ENDPOINT"),
 	}
+	cfg.Models = LoadModels()
+	return cfg
 }
 
 // ProfileImages returns the daemon-owned runtime tags. Empty fields use the

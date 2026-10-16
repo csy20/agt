@@ -18,11 +18,12 @@ import (
 // Session is one conversation. It is bound to a single repository path.
 // Runs linked from the session keep their own snapshot, budget, and result.
 type Session struct {
-	ID        string
-	RepoPath  string
-	Title     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID          string
+	RepoPath    string
+	Title       string
+	ModelConfig string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // SessionMessage is one ordered row in a conversation.
@@ -65,7 +66,7 @@ type SubmitResult struct {
 	Pending []PendingPatch
 }
 
-const sessionColumns = `id, repo_path, title, created_at, updated_at`
+const sessionColumns = `id, repo_path, title, model_config, created_at, updated_at`
 
 func nullable(v string) any {
 	if v == "" {
@@ -87,12 +88,25 @@ func ValidClientMessageID(raw string) bool {
 	return true
 }
 
+// SetSessionModel saves the session's preferred configuration name.
+// It does not create a run and does not call a model.
+func (s *Store) SetSessionModel(ctx context.Context, id, name string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE sessions SET model_config=$2, updated_at=now() WHERE id=$1`, id, name)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) CreateSession(ctx context.Context, repo, title string) (Session, error) {
 	if strings.TrimSpace(repo) == "" {
 		return Session{}, fmt.Errorf("repo_path is required")
 	}
 	sess := Session{ID: id.New("ses_"), RepoPath: repo, Title: clipTitle(title)}
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO sessions (id, repo_path, title) VALUES ($1,$2,$3)`,
 			sess.ID, sess.RepoPath, sess.Title)
@@ -198,7 +212,7 @@ func (s *Store) Submit(ctx context.Context, in SubmitInput) (SubmitResult, error
 		return SubmitResult{}, fmt.Errorf("content is required")
 	}
 	var result SubmitResult
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		sess, err := lockSession(ctx, tx, in.SessionID)
 		if err != nil {
 			return err
@@ -298,7 +312,7 @@ func (s *Store) AppendSessionMessage(ctx context.Context, msg SessionMessage) er
 	if msg.SessionID == "" || !ValidClientMessageID(msg.ClientMessageID) {
 		return fmt.Errorf("session message is incomplete")
 	}
-	return s.withTx(ctx, func(tx pgx.Tx) error {
+	return s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := lockSession(ctx, tx, msg.SessionID); err != nil {
 			return err
 		}
@@ -357,7 +371,7 @@ func (s *Store) HasEvent(ctx context.Context, runID, eventType string) (bool, er
 // PendingPatches lists succeeded session runs whose patch was not applied.
 func (s *Store) PendingPatches(ctx context.Context, sessionID string) ([]PendingPatch, error) {
 	var out []PendingPatch
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var err error
 		out, err = pendingInTx(ctx, tx, sessionID)
 		return err
@@ -416,9 +430,9 @@ func patchFromResult(current Run) (PendingPatch, bool) {
 	}
 	change := ""
 	switch body.Outcome {
-	case "repaired":
+	case "repaired", "feature_implemented", "checks_passed":
 		change = "verified"
-	case "answered":
+	case "answered", "already_satisfied":
 		return PendingPatch{}, false
 	default:
 		if strings.TrimSpace(body.Diff) == "" {
@@ -461,7 +475,7 @@ func ResultNote(current Run, applied bool) string {
 	switch {
 	case applied:
 		change = "applied"
-	case body.Outcome == "repaired":
+	case body.Outcome == "repaired" || body.Outcome == "feature_implemented" || body.Outcome == "checks_passed":
 		change = "verified"
 	case strings.TrimSpace(body.Diff) != "":
 		change = "proposed"
@@ -530,7 +544,7 @@ func insertSessionMessage(ctx context.Context, tx pgx.Tx, msg SessionMessage) (S
 	_, err := tx.Exec(ctx, `
 		INSERT INTO session_messages (session_id, seq, client_message_id, role, kind, content, run_id)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		msg.SessionID, seq, msg.ClientMessageID, msg.Role, msg.Kind, msg.Content, nullable(msg.RunID))
+		msg.SessionID, seq, msg.ClientMessageID, msg.Role, msg.Kind, scrubText(ctx, msg.Content), nullable(msg.RunID))
 	if err != nil {
 		return SessionMessage{}, err
 	}
@@ -556,6 +570,22 @@ func insertRunTx(ctx context.Context, tx pgx.Tx, in CreateInput) (Run, error) {
 	default:
 		return Run{}, fmt.Errorf("interaction must be agent, ask, or plan")
 	}
+	switch in.TaskType {
+	case "", "repair":
+		in.TaskType = "repair"
+	case "feature", "refactor":
+		if in.Interaction != "agent" {
+			return Run{}, fmt.Errorf("%s requires interaction agent", in.TaskType)
+		}
+		if strings.TrimSpace(in.ContractDigest) == "" || len(in.ContractJSON) == 0 || string(in.ContractJSON) == "null" {
+			return Run{}, fmt.Errorf("%s requires a verification contract", in.TaskType)
+		}
+	default:
+		return Run{}, fmt.Errorf("task_type must be repair, feature, or refactor")
+	}
+	if in.TaskType == "repair" && len(strings.TrimSpace(string(in.ContractJSON))) > 0 && strings.TrimSpace(string(in.ContractJSON)) != "null" {
+		return Run{}, fmt.Errorf("repair does not take a verification contract")
+	}
 	deadline := time.Now().Add(time.Duration(in.WallSeconds) * time.Second)
 	var script any
 	if len(in.ScriptJSON) > 0 {
@@ -569,24 +599,36 @@ func insertRunTx(ctx context.Context, tx pgx.Tx, in CreateInput) (Run, error) {
 	if parsed, err := profile.Parse(profileJSON); err == nil {
 		identity = parsed.Identity()
 	}
+	contractJSON := "null"
+	if in.TaskType != "repair" {
+		contractJSON = string(in.ContractJSON)
+	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO runs (
 			id, idempotency_key, request_hash, goal, repo_path, state, state_version,
 			budget_cents, agent_version, trace_id, provider, script_path, script_json,
-			max_steps, deadline_at, profile_json, interaction, session_id
+			max_steps, deadline_at, profile_json, interaction, session_id,
+			model_config, model_name, model_endpoint, input_per_million, output_per_million,
+			pricing_recorded, credential_env, task_type, contract_json, contract_digest
 		) VALUES (
-			$1,$2,$3,$4,$5,'CREATED',1,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb,$15,$16
+			$1,$2,$3,$4,$5,'CREATED',1,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb,$15,$16,
+			$17,$18,$19,$20,$21,$22,$23,$24,$25::jsonb,$26
 		)`,
-		in.ID, in.IdempotencyKey, in.RequestHash, in.Goal, in.RepoPath, in.BudgetCents,
+		in.ID, in.IdempotencyKey, in.RequestHash, scrubText(ctx, in.Goal), in.RepoPath, in.BudgetCents,
 		in.AgentVersion, in.TraceID, in.Provider, in.ScriptPath, script, in.MaxSteps, deadline,
 		string(profileJSON), in.Interaction, nullable(in.SessionID),
+		in.ModelConfig, in.ModelName, in.ModelEndpoint, in.InputPerMillion, in.OutputPerMillion,
+		in.PricingRecorded, in.CredentialEnv, in.TaskType, contractJSON, in.ContractDigest,
 	)
 	if err != nil {
 		return Run{}, err
 	}
 	if _, err := appendEvent(ctx, tx, in.ID, "run.created", "user", "local", map[string]any{
-		"goal": in.Goal, "repo_path": in.RepoPath, "provider": in.Provider, "profile": identity,
+		"goal": scrubText(ctx, in.Goal), "repo_path": in.RepoPath, "provider": in.Provider, "profile": identity,
 		"interaction": in.Interaction, "session_id": in.SessionID,
+		"task_type": in.TaskType, "contract_digest": in.ContractDigest,
+		"model_config": in.ModelConfig, "model_name": in.ModelName, "model_endpoint": in.ModelEndpoint,
+		"scripted": in.Provider == "fake",
 	}); err != nil {
 		return Run{}, err
 	}
@@ -606,7 +648,7 @@ func clipTitle(s string) string {
 
 func scanSession(row pgx.Row) (Session, error) {
 	var sess Session
-	err := row.Scan(&sess.ID, &sess.RepoPath, &sess.Title, &sess.CreatedAt, &sess.UpdatedAt)
+	err := row.Scan(&sess.ID, &sess.RepoPath, &sess.Title, &sess.ModelConfig, &sess.CreatedAt, &sess.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}

@@ -45,7 +45,7 @@ func ParseRunLabels(raw string) (string, bool) {
 // It does not delete the data directory or result artifacts. lookup errors skip
 // that container.
 func (r *Runner) Sweep(ctx context.Context, lookup func(runID string) (run.State, bool, error)) (int, error) {
-	ids, err := labelledRunIDs(ctx)
+	ids, err := labelledRunIDs(ctx, r.namespace())
 	if err != nil {
 		return 0, err
 	}
@@ -66,8 +66,11 @@ func (r *Runner) Sweep(ctx context.Context, lookup func(runID string) (run.State
 	return removed, nil
 }
 
-func labelledRunIDs(ctx context.Context) ([]string, error) {
-	cmd := dockerCommand(ctx, "ps", "-a", "--filter", "label=agt-run", "--format", "{{json .Labels}}")
+func labelledRunIDs(ctx context.Context, namespace string) ([]string, error) {
+	cmd := dockerCommand(ctx, "ps", "-a",
+		"--filter", "label=agt-namespace="+namespace,
+		"--filter", "label=agt-run",
+		"--format", "{{json .Labels}}")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("docker ps: %w", err)

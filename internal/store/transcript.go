@@ -38,7 +38,7 @@ func (s *Store) ListMessages(ctx context.Context, runID string) ([]TranscriptMes
 }
 
 func (s *Store) AppendMessage(ctx context.Context, runID string, msg TranscriptMessage) error {
-	return s.withTx(ctx, func(tx pgx.Tx) error {
+	return s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := lockRun(ctx, tx, runID); err != nil {
 			return err
 		}
@@ -63,7 +63,7 @@ func appendTranscript(ctx context.Context, tx pgx.Tx, runID string, msg Transcri
 	_, err := tx.Exec(ctx, `
 		INSERT INTO model_messages (run_id, seq, contract, role, content, tool_call_id, tool_name, arguments)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		runID, seq, contract, msg.Role, msg.Content, msg.ToolCallID, msg.ToolName, msg.Arguments)
+		runID, seq, contract, msg.Role, scrubText(ctx, msg.Content), msg.ToolCallID, msg.ToolName, scrubText(ctx, msg.Arguments))
 	return err
 }
 

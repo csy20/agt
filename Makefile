@@ -6,6 +6,11 @@ export AGT_IMAGE_NODE := agt-sandbox:node
 export AGT_SANDBOX_IMAGE := $(AGT_IMAGE_PYTHON)
 export AGT_LISTEN := 127.0.0.1:8787
 
+GIT_REV := $(shell git rev-parse --short=12 HEAD)
+GIT_DIRTY := $(shell git status --porcelain | grep -q . && echo -dirty)
+BUILD_STAMP := $(shell date -u +%Y%m%dT%H%M%SZ)
+LDFLAGS := -X github.com/csy20/agt/internal/version.Build=local+$(GIT_REV)$(GIT_DIRTY).$(BUILD_STAMP)
+
 # go build -o uses the name exactly and does not append .exe.
 EXE :=
 ifeq ($(OS),Windows_NT)
@@ -19,8 +24,8 @@ UNIT_PKGS := $(shell sed '/^[[:space:]]*\#/d;/^[[:space:]]*$$/d' scripts/unit-pa
 
 build:
 	mkdir -p $(BIN_DIR)
-	go build -o $(BIN_DIR)/agt$(EXE) ./cmd/agt
-	go build -o $(BIN_DIR)/agtd$(EXE) ./cmd/agtd
+	go build -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/agt$(EXE) ./cmd/agt
+	go build -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/agtd$(EXE) ./cmd/agtd
 
 up:
 	docker compose -f deploy/compose.yaml up -d --wait
@@ -33,8 +38,12 @@ image:
 # test is the integration job. It starts Postgres, builds the three images,
 # and fails when Docker, an image, or Postgres is missing. AGT_INTEGRATION=1
 # turns the old skips into failures. The timeout covers the scripted repair batch.
+# AGT_DATABASE_URL here is the maintenance database. Tests create agt_test_*
+# databases and refuse to reset or drop database agt. make demo keeps the
+# shared development URL exported above.
 test: up image
-	AGT_INTEGRATION=1 go test -timeout 20m ./...
+	AGT_INTEGRATION=1 AGT_DATABASE_URL=postgres://agt:agt@127.0.0.1:54329/postgres?sslmode=disable \
+		go test -timeout 20m ./...
 
 # unit does not start Postgres or Docker. It clears the integration variables
 # that this Makefile exports. The sandbox package then skips

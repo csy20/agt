@@ -21,6 +21,7 @@ import (
 
 	"github.com/csy20/agt/internal/config"
 	"github.com/csy20/agt/internal/usage"
+	"github.com/csy20/agt/internal/verify"
 	"github.com/csy20/agt/internal/version"
 )
 
@@ -31,11 +32,14 @@ var errStreamIdle = errors.New("event stream went quiet")
 const streamIdle = 45 * time.Second
 
 type daemonIdentity struct {
-	Product  string `json:"product"`
-	Version  string `json:"version"`
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
-	Listen   string `json:"listen"`
+	Product      string   `json:"product"`
+	Version      string   `json:"version"`
+	Contract     string   `json:"contract"`
+	Build        string   `json:"build"`
+	Capabilities []string `json:"capabilities"`
+	Provider     string   `json:"provider"`
+	Model        string   `json:"model"`
+	Listen       string   `json:"listen"`
 }
 
 func clientBase(explicit string) (string, bool) {
@@ -71,6 +75,9 @@ func discover(base string) error {
 	if got != version.Product {
 		return fmt.Errorf("agtd at %s is version %s and this agt is %s. Next: install matching agt and agtd binaries and restart agtd", base, got, version.Product)
 	}
+	if missing := version.MissingAdvertised(resp.Header.Get(version.ContractHeader), version.ParseCapabilities(resp.Header.Get(version.CapabilitiesHeader))); len(missing) > 0 {
+		return version.IncompatibleDaemon(base, got, missing)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("agtd %s at %s is up but /healthz returned %d. Next: run `agt doctor`", got, base, resp.StatusCode)
 	}
@@ -102,6 +109,9 @@ func fetchIdentity(base string) (daemonIdentity, error) {
 	}
 	if id.Product != version.Name || id.Version != version.Product {
 		return daemonIdentity{}, fmt.Errorf("identity %s %s does not match this agt %s %s. Next: install matching binaries and restart agtd", id.Product, id.Version, version.Name, version.Product)
+	}
+	if missing := version.MissingAdvertised(id.Contract, id.Capabilities); len(missing) > 0 {
+		return daemonIdentity{}, version.IncompatibleDaemon(base, id.Version, missing)
 	}
 	return id, nil
 }
@@ -264,13 +274,64 @@ func stillRunning(state string) bool {
 }
 
 type runView struct {
-	State       string          `json:"state"`
-	SpentMicros int64           `json:"spent_micros"`
-	BudgetCents int             `json:"budget_cents"`
-	Worktree    string          `json:"worktree"`
-	RepoPath    string          `json:"repo_path"`
-	Error       string          `json:"error"`
-	Result      json.RawMessage `json:"result"`
+	State               string          `json:"state"`
+	SpentMicros         int64           `json:"spent_micros"`
+	BudgetCents         int             `json:"budget_cents"`
+	Worktree            string          `json:"worktree"`
+	RepoPath            string          `json:"repo_path"`
+	Error               string          `json:"error"`
+	TaskType            string          `json:"task_type"`
+	ContractDigest      string          `json:"contract_digest"`
+	VerificationOutcome string          `json:"verification_outcome"`
+	VerificationDigest  string          `json:"verification_digest"`
+	Contract            json.RawMessage `json:"contract"`
+	Baseline            json.RawMessage `json:"baseline"`
+	Final               json.RawMessage `json:"final"`
+	Result              json.RawMessage `json:"result"`
+}
+
+func verificationLines(view runView) []string {
+	var lines []string
+	if view.TaskType != "" {
+		lines = append(lines, "task "+view.TaskType)
+	}
+	if view.VerificationOutcome != "" {
+		lines = append(lines, "verification "+view.VerificationOutcome)
+	}
+	if view.ContractDigest != "" {
+		lines = append(lines, "contract "+view.ContractDigest)
+	}
+	lines = append(lines, contractLines(view.Contract)...)
+	failures := failureLines(view.Final)
+	if len(failures) == 0 {
+		failures = failureLines(view.Baseline)
+	}
+	for _, line := range failures {
+		lines = append(lines, "failure "+line)
+	}
+	return lines
+}
+
+func contractLines(raw json.RawMessage) []string {
+	contract, err := verify.Load(raw)
+	if err != nil {
+		return nil
+	}
+	lines := make([]string, 0, len(contract.Checks))
+	for _, check := range contract.Checks {
+		lines = append(lines, "check "+check.Role+" "+check.Name+" "+strings.Join(check.Argv, " "))
+	}
+	return lines
+}
+
+func failureLines(raw json.RawMessage) []string {
+	var doc struct {
+		Checks []verify.CheckResult `json:"checks"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil
+	}
+	return verify.FailureLines(doc.Checks)
 }
 
 func fetchRun(base, runID string) (runView, error) {
@@ -432,6 +493,8 @@ func renderRun(base, runID string, view runView, jsonOut bool) int {
 		summary := map[string]any{
 			"id": runID, "state": view.State, "spent_micros": view.SpentMicros,
 			"budget_cents": view.BudgetCents, "repo_path": view.RepoPath, "worktree": view.Worktree,
+			"task_type": view.TaskType, "verification_outcome": view.VerificationOutcome,
+			"contract_digest": view.ContractDigest, "verification_digest": view.VerificationDigest,
 			"next": next,
 		}
 		if len(view.Result) > 0 && string(view.Result) != "null" {
@@ -467,6 +530,9 @@ func writeHumanRun(runID string, view runView, next []string) {
 		}
 	} else {
 		fmt.Printf("state %s\ncost %s budget %d cents\n", view.State, usage.USD(view.SpentMicros), view.BudgetCents)
+	}
+	for _, line := range verificationLines(view) {
+		fmt.Println(line)
 	}
 	if view.RepoPath != "" {
 		fmt.Printf("repo %s\n", view.RepoPath)

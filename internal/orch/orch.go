@@ -25,6 +25,7 @@ import (
 	"github.com/csy20/agt/internal/telemetry"
 	"github.com/csy20/agt/internal/tools"
 	"github.com/csy20/agt/internal/usage"
+	"github.com/csy20/agt/internal/verify"
 	"github.com/csy20/agt/internal/workspace"
 )
 
@@ -140,6 +141,9 @@ func (o *Orchestrator) dispatch(ctx context.Context, current store.Run) error {
 	case run.Contextualising:
 		return o.seedContext(ctx, current)
 	case run.Planning, run.Observing:
+		if current.State == run.Planning && verify.NeedsContract(current.TaskType) && !baselineStored(current.BaselineJSON) {
+			return o.contractBaseline(ctx, current)
+		}
 		return o.modelTurn(ctx, current)
 	case run.Verifying:
 		return o.verify(ctx, current)
@@ -265,7 +269,8 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 	}
 	// Reserve is a pre-check, not a ledger hold. A provider that reports no
 	// usage, or prices that are both zero, cannot enforce a dollar cap.
-	reserve := o.reserveMicros(turns)
+	prices := o.pricesFor(current)
+	reserve := o.reserveMicros(turns, prices)
 	limit := usage.CentsToMicros(int64(current.BudgetCents))
 	if reserve > 0 && current.SpentMicros+reserve > limit {
 		return o.pauseForBudget(ctx, current, "reserved model cost exceeds the budget", reserve)
@@ -299,8 +304,8 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 		o.noteAttempts(ctx, current, err)
 		return err
 	}
-	cost := usage.CostMicros(int64(resp.InputTokens), o.prices.InputPerMillion) +
-		usage.CostMicros(int64(resp.OutputTokens), o.prices.OutputPerMillion)
+	cost := usage.CostMicros(int64(resp.InputTokens), prices.InputPerMillion) +
+		usage.CostMicros(int64(resp.OutputTokens), prices.OutputPerMillion)
 	intent := store.Intent{
 		Plan:         resp.Plan,
 		Text:         resp.Text,
@@ -338,6 +343,7 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 				decision.Reason = "this edit already succeeded"
 			}
 		}
+		denyProtectedEdit(current, resp.Tool, &decision)
 		intent.Kind = "tool"
 		intent.Tool = resp.Tool
 		intent.Canonical = decision.Canonical
@@ -358,8 +364,15 @@ func (o *Orchestrator) modelTurn(ctx context.Context, current store.Run) error {
 	return nil
 }
 
-func (o *Orchestrator) reserveMicros(turns []model.Turn) int64 {
-	if o.prices.InputPerMillion <= 0 && o.prices.OutputPerMillion <= 0 {
+func (o *Orchestrator) pricesFor(current store.Run) usage.Prices {
+	if current.PricingRecorded {
+		return usage.Prices{InputPerMillion: current.InputPerMillion, OutputPerMillion: current.OutputPerMillion}
+	}
+	return o.prices
+}
+
+func (o *Orchestrator) reserveMicros(turns []model.Turn, prices usage.Prices) int64 {
+	if prices.InputPerMillion <= 0 && prices.OutputPerMillion <= 0 {
 		return 0
 	}
 	tokens := 0
@@ -368,8 +381,8 @@ func (o *Orchestrator) reserveMicros(turns []model.Turn) int64 {
 		tokens += model.EstimateTokens(turn.Arguments)
 		tokens += model.EstimateTokens(turn.ToolName)
 	}
-	return usage.CostMicros(int64(tokens), o.prices.InputPerMillion) +
-		usage.CostMicros(reservedOutputTokens, o.prices.OutputPerMillion)
+	return usage.CostMicros(int64(tokens), prices.InputPerMillion) +
+		usage.CostMicros(reservedOutputTokens, prices.OutputPerMillion)
 }
 
 func (o *Orchestrator) pauseForBudget(ctx context.Context, current store.Run, reason string, reserved int64) error {
@@ -516,8 +529,12 @@ func (o *Orchestrator) verify(ctx context.Context, current store.Run) error {
 	switch policy.NormalizeInteraction(current.Interaction) {
 	case "ask", "plan":
 		// An answer is the terminal result. Repair verification, including the
-		// baseline test, is not part of these modes.
+		// baseline test, is not part of these modes. A feature or refactor
+		// contract is not read here.
 		return o.finishAnswer(ctx, current)
+	}
+	if verify.NeedsContract(current.TaskType) {
+		return o.verifyContract(ctx, current)
 	}
 	ws, err := o.workspace(ctx, current)
 	if err != nil {

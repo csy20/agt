@@ -43,7 +43,7 @@ func ExampleFrames(width int, color bool) []Frame {
 	base := func(scene string) Snapshot {
 		return Snapshot{
 			Width: width, Height: 32, Color: color, Example: true, Scene: scene,
-			Repo: "eval/fixtures/payrepo", Model: "local-repair", Mode: "agent",
+			Repo: "eval/fixtures/payrepo", Model: "local-repair", ModelConfig: "default", Scripted: true, Mode: "agent",
 			Profile: "python", Network: "none", BudgetCents: 100,
 			Placeholder: "Repair a failing test, or /help",
 			RunID:       "run_example",

@@ -1,0 +1,106 @@
+# Local CI definition. It was not executed by pushing this tree.
+# Ordinary jobs do not call a hosted model and do not use database agt.
+# The paid-eval job is opt-in and refuses to run an evaluation.
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      paid_eval:
+        description: Opt in to a paid model evaluation. Ordinary CI does not do this.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  linux-unit:
+    name: linux unit and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.5"
+      - name: Unit tests
+        run: make unit
+      - name: Vet
+        run: go vet ./...
+
+  linux-integration:
+    name: linux container integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.5"
+      - name: Isolated integration
+        run: make test
+
+  windows-unit:
+    name: windows unit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.5"
+      - name: Native unit tests
+        shell: pwsh
+        run: ./scripts/test.ps1 -Mode unit
+
+  macos-unit:
+    name: macos unit
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.5"
+      - name: Native unit tests
+        run: make unit
+
+  compile-only:
+    name: compile ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.5"
+      - name: Compile tests only
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -eu
+          mkdir -p /tmp/agt-compile
+          go test -c -o /tmp/agt-compile/agent.test ./internal/agent
+          go test -c -o /tmp/agt-compile/policy.test ./internal/policy
+          echo "compile-only ${GOOS}/${GOARCH}; binaries were not executed"
+
+  paid-eval:
+    name: paid eval opt-in
+    if: github.event_name == 'workflow_dispatch' && inputs.paid_eval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Do not call a model
+        run: |
+          echo "Paid evaluation is opt-in and is not implemented in this workflow."
+          echo "No model was called."

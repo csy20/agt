@@ -82,6 +82,17 @@ func formatRunList(raw []byte) (string, error) {
 	return b.String(), nil
 }
 
+func rawMessage(v any) json.RawMessage {
+	if v == nil {
+		return nil
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
 func statusCmd(args []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -138,6 +149,25 @@ func printStatus(base, runID string) int {
 		return 1
 	}
 	fmt.Printf("state %v\n", view["state"])
+	if task, _ := view["task_type"].(string); task != "" {
+		fmt.Printf("task %s\n", task)
+	}
+	if outcome, _ := view["verification_outcome"].(string); outcome != "" {
+		fmt.Printf("verification %s\n", outcome)
+	}
+	if digest, _ := view["contract_digest"].(string); digest != "" {
+		fmt.Printf("contract %s\n", digest)
+	}
+	for _, line := range contractLines(rawMessage(view["contract"])) {
+		fmt.Println(line)
+	}
+	failures := failureLines(rawMessage(view["final"]))
+	if len(failures) == 0 {
+		failures = failureLines(rawMessage(view["baseline"]))
+	}
+	for _, line := range failures {
+		fmt.Println("failure " + line)
+	}
 	if n, ok := asInt64(view["usage_micros"]); ok {
 		fmt.Printf("usage %s\n", usage.USD(n))
 	} else if n, ok := asInt64(view["spent_micros"]); ok {

@@ -25,40 +25,64 @@ id, idempotency_key, request_hash, goal, repo_path, worktree, state, state_versi
 risk_level, budget_cents, spent_micros, agent_version, trace_id, provider, script_path,
 COALESCE(script_json, 'null'::jsonb), COALESCE(plan_json, 'null'::jsonb), COALESCE(result_json, 'null'::jsonb),
 error, step_count, max_steps, deadline_at, created_at, updated_at, profile_json, interaction,
-COALESCE(session_id, '')`
+COALESCE(session_id, ''), model_config, model_name, model_endpoint, input_per_million,
+output_per_million, pricing_recorded, credential_env, task_type,
+COALESCE(contract_json, 'null'::jsonb), contract_digest,
+COALESCE(baseline_json, 'null'::jsonb), COALESCE(final_json, 'null'::jsonb),
+verification_outcome, verification_digest`
 
 type Store struct {
 	pool *pgxpool.Pool
+	// Redact removes credential values before they are stored in a transcript,
+	// an event, or a result. Nil leaves text unchanged.
+	Redact func(string) string
+	// resetToken is empty on a production store. Reset runs only when this
+	// token matches the harness row in a disposable database.
+	resetToken string
 }
 
 type Run struct {
-	ID             string
-	IdempotencyKey string
-	RequestHash    string
-	Goal           string
-	RepoPath       string
-	Worktree       string
-	State          run.State
-	StateVersion   int64
-	RiskLevel      string
-	BudgetCents    int
-	SpentMicros    int64
-	AgentVersion   string
-	TraceID        string
-	Provider       string
-	ScriptPath     string
-	ScriptJSON     json.RawMessage
-	Plan           json.RawMessage
-	Result         json.RawMessage
-	Error          string
-	StepCount      int
-	MaxSteps       int
-	Deadline       time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	ProfileJSON    json.RawMessage
-	Interaction    string
-	SessionID      string
+	ID                  string
+	IdempotencyKey      string
+	RequestHash         string
+	Goal                string
+	RepoPath            string
+	Worktree            string
+	State               run.State
+	StateVersion        int64
+	RiskLevel           string
+	BudgetCents         int
+	SpentMicros         int64
+	AgentVersion        string
+	TraceID             string
+	Provider            string
+	ScriptPath          string
+	ScriptJSON          json.RawMessage
+	Plan                json.RawMessage
+	Result              json.RawMessage
+	Error               string
+	StepCount           int
+	MaxSteps            int
+	Deadline            time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	ProfileJSON         json.RawMessage
+	Interaction         string
+	SessionID           string
+	ModelConfig         string
+	ModelName           string
+	ModelEndpoint       string
+	InputPerMillion     int64
+	OutputPerMillion    int64
+	PricingRecorded     bool
+	CredentialEnv       string
+	TaskType            string
+	ContractJSON        json.RawMessage
+	ContractDigest      string
+	BaselineJSON        json.RawMessage
+	FinalJSON           json.RawMessage
+	VerificationOutcome string
+	VerificationDigest  string
 }
 
 type Event struct {
@@ -71,22 +95,32 @@ type Event struct {
 }
 
 type CreateInput struct {
-	ID             string
-	IdempotencyKey string
-	RequestHash    string
-	Goal           string
-	RepoPath       string
-	BudgetCents    int
-	MaxSteps       int
-	WallSeconds    int
-	AgentVersion   string
-	TraceID        string
-	Provider       string
-	ScriptPath     string
-	ScriptJSON     json.RawMessage
-	ProfileJSON    json.RawMessage
-	Interaction    string
-	SessionID      string
+	ID               string
+	IdempotencyKey   string
+	RequestHash      string
+	Goal             string
+	RepoPath         string
+	BudgetCents      int
+	MaxSteps         int
+	WallSeconds      int
+	AgentVersion     string
+	TraceID          string
+	Provider         string
+	ScriptPath       string
+	ScriptJSON       json.RawMessage
+	ProfileJSON      json.RawMessage
+	Interaction      string
+	SessionID        string
+	ModelConfig      string
+	ModelName        string
+	ModelEndpoint    string
+	InputPerMillion  int64
+	OutputPerMillion int64
+	PricingRecorded  bool
+	CredentialEnv    string
+	TaskType         string
+	ContractJSON     json.RawMessage
+	ContractDigest   string
 }
 
 func Open(ctx context.Context, url string) (*Store, error) {
@@ -128,7 +162,13 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.applyMigration(ctx, 5, "migrations/005_interaction.sql"); err != nil {
 		return err
 	}
-	return s.applyMigration(ctx, 6, "migrations/006_sessions.sql")
+	if err := s.applyMigration(ctx, 6, "migrations/006_sessions.sql"); err != nil {
+		return err
+	}
+	if err := s.applyMigration(ctx, 7, "migrations/007_models.sql"); err != nil {
+		return err
+	}
+	return s.applyMigration(ctx, 8, "migrations/008_verify.sql")
 }
 
 func (s *Store) applyMigration(ctx context.Context, version int, name string) error {
@@ -140,9 +180,8 @@ func (s *Store) applyMigration(ctx context.Context, version int, name string) er
 	if err != nil {
 		return err
 	}
-	return s.withTx(ctx, func(tx pgx.Tx) error {
-		// 8675310 is only the migration lock. Tests hold session lock 8675309
-		// on another connection for the whole test; sharing that key deadlocks.
+	return s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		// 8675310 serializes migrations inside this database only.
 		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '30s'`); err != nil {
 			return err
 		}
@@ -199,6 +238,24 @@ func (s *Store) migrationApplied(ctx context.Context, version int) (bool, error)
 }
 
 func (s *Store) Reset(ctx context.Context) error {
+	// An unarmed store must not query or truncate. Production never sets the token.
+	if strings.TrimSpace(s.resetToken) == "" {
+		return fmt.Errorf("reset is not armed on this store")
+	}
+	var name string
+	if err := s.pool.QueryRow(ctx, `SELECT current_database()`).Scan(&name); err != nil {
+		return err
+	}
+	var marker, purpose string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE((SELECT value FROM agt_harness WHERE key = 'token'), ''),
+			COALESCE((SELECT value FROM agt_harness WHERE key = 'purpose'), '')`).Scan(&marker, &purpose); err != nil {
+		return fmt.Errorf("reset refused: %w", err)
+	}
+	if err := AuthorizeReset(s.resetToken, name, marker, purpose); err != nil {
+		return err
+	}
 	_, err := s.pool.Exec(ctx, `
 		TRUNCATE model_messages, usage_entries, approvals, commands, run_events, run_jobs,
 			session_messages, runs, sessions
@@ -236,7 +293,7 @@ func (s *Store) CreateRun(ctx context.Context, in CreateInput) (Run, bool, error
 		return Run{}, false, fmt.Errorf("interaction must be agent, ask, or plan")
 	}
 	var out Run
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		var err error
 		out, err = insertRunTx(ctx, tx, in)
 		return err
@@ -292,7 +349,7 @@ func (s *Store) getByIdempotency(ctx context.Context, key string) (Run, error) {
 
 func (s *Store) Transition(ctx context.Context, runID string, fromVersion int64, to run.State, actor string) (Run, error) {
 	var out Run
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		cur, err := lockRun(ctx, tx, runID)
 		if err != nil {
 			return err
@@ -326,7 +383,7 @@ func (s *Store) Transition(ctx context.Context, runID string, fromVersion int64,
 
 func (s *Store) AppendEvent(ctx context.Context, runID, typ, actorType, actorID string, payload any) (int64, error) {
 	var seq int64
-	err := s.withTx(ctx, func(tx pgx.Tx) error {
+	err := s.withTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := lockRun(ctx, tx, runID); err != nil {
 			return err
 		}
@@ -391,11 +448,61 @@ func (s *Store) AppendDisplay(ctx context.Context, runID, text string) error {
 	return err
 }
 
+// SetBaseline records the pre-edit check results once.
+// A second call does not replace them. The contract columns are not written.
+func (s *Store) SetBaseline(ctx context.Context, runID string, baseline []byte) error {
+	if len(bytesTrim(baseline)) == 0 {
+		return fmt.Errorf("baseline is empty")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE runs SET baseline_json=$2::jsonb, updated_at=now()
+		WHERE id=$1 AND baseline_json = 'null'::jsonb`, runID, string(baseline))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM runs WHERE id=$1`, runID).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return fmt.Errorf("baseline is already recorded")
+}
+
+// SetVerification records the latest verifier results and the artifact digest
+// they apply to. It does not update contract_json or contract_digest.
+func (s *Store) SetVerification(ctx context.Context, runID string, final []byte, outcome, digest string) error {
+	if len(bytesTrim(final)) == 0 {
+		final = []byte("null")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE runs
+		SET final_json=$2::jsonb, verification_outcome=$3, verification_digest=$4, updated_at=now()
+		WHERE id=$1`, runID, string(final), outcome, digest)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func bytesTrim(raw []byte) []byte {
+	return []byte(strings.TrimSpace(string(raw)))
+}
+
 func (s *Store) SetResult(ctx context.Context, runID string, result any, errText string) error {
 	body, err := json.Marshal(result)
 	if err != nil {
 		return err
 	}
+	errText = scrubText(context.WithValue(ctx, scrubKey{}, s.Redact), errText)
+	body = []byte(scrubText(context.WithValue(ctx, scrubKey{}, s.Redact), string(body)))
 	tag, err := s.pool.Exec(ctx, `UPDATE runs SET result_json=$2::jsonb, error=$3, updated_at=now() WHERE id=$1`, runID, string(body), errText)
 	if err != nil {
 		return err
@@ -412,16 +519,29 @@ func (s *Store) UsageTotal(ctx context.Context, runID string) (int64, error) {
 	return n, err
 }
 
-func (s *Store) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
+type scrubKey struct{}
+
+func (s *Store) withTx(ctx context.Context, fn func(context.Context, pgx.Tx) error) error {
+	if s != nil && s.Redact != nil {
+		ctx = context.WithValue(ctx, scrubKey{}, s.Redact)
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := fn(tx); err != nil {
+	if err := fn(ctx, tx); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func scrubText(ctx context.Context, s string) string {
+	clean, _ := ctx.Value(scrubKey{}).(func(string) string)
+	if clean == nil || s == "" {
+		return s
+	}
+	return clean(s)
 }
 
 func isUnique(err error) bool {
@@ -436,13 +556,16 @@ func lockRun(ctx context.Context, tx pgx.Tx, runID string) (Run, error) {
 func scanRun(row pgx.Row) (Run, error) {
 	var r Run
 	var state string
-	var script, plan, result, profileJSON []byte
+	var script, plan, result, profileJSON, contractJSON, baselineJSON, finalJSON []byte
 	err := row.Scan(
 		&r.ID, &r.IdempotencyKey, &r.RequestHash, &r.Goal, &r.RepoPath, &r.Worktree,
 		&state, &r.StateVersion, &r.RiskLevel, &r.BudgetCents, &r.SpentMicros,
 		&r.AgentVersion, &r.TraceID, &r.Provider, &r.ScriptPath,
 		&script, &plan, &result, &r.Error, &r.StepCount, &r.MaxSteps,
 		&r.Deadline, &r.CreatedAt, &r.UpdatedAt, &profileJSON, &r.Interaction, &r.SessionID,
+		&r.ModelConfig, &r.ModelName, &r.ModelEndpoint, &r.InputPerMillion, &r.OutputPerMillion,
+		&r.PricingRecorded, &r.CredentialEnv, &r.TaskType, &contractJSON, &r.ContractDigest,
+		&baselineJSON, &finalJSON, &r.VerificationOutcome, &r.VerificationDigest,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Run{}, ErrNotFound
@@ -455,6 +578,12 @@ func scanRun(row pgx.Row) (Run, error) {
 	r.Plan = plan
 	r.Result = result
 	r.ProfileJSON = profileJSON
+	r.ContractJSON = contractJSON
+	r.BaselineJSON = baselineJSON
+	r.FinalJSON = finalJSON
+	if r.TaskType == "" {
+		r.TaskType = "repair"
+	}
 	return r, nil
 }
 
@@ -463,6 +592,7 @@ func appendEvent(ctx context.Context, tx pgx.Tx, runID, typ, actorType, actorID 
 	if err != nil {
 		return 0, err
 	}
+	body = []byte(scrubText(ctx, string(body)))
 	var seq int64
 	err = tx.QueryRow(ctx, `
 		INSERT INTO run_events (run_id, sequence_no, event_type, actor_type, actor_id, payload)
